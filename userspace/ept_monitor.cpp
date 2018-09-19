@@ -52,13 +52,11 @@ struct vmcall_registers_t
 
 extern "C" void _platform_vmcall(struct vmcall_registers_t *regs) noexcept;
 
-void
-hello_world()
-{ std::clog << "hello world\n"; }
+std::string testString = "hello world\n";
 
 void
-hooked_hello_world()
-{ std::clog << "hooked hello world\n"; }
+hello_world()
+{ std::clog << testString; }
 
 int main()
 {
@@ -102,15 +100,17 @@ int main()
     }
 
     hello_world();
+    auto* str = testString.data();
+    str[0] = 'd';
+    hello_world();
 
-    // regs.r02 = 3;
-    // regs.r03 = reinterpret_cast<uintptr_t>(hello_world);
-    // _platform_vmcall(&regs);
-    // if (!regs.r02)
-    // {
-    //     std::clog << "somthing went wrong\n";
-    //     return 1;
-    // }
+    regs.r02 = 4;
+    _platform_vmcall(&regs);
+    if (!regs.r02)
+    {
+        std::clog << "somthing went wrong\n";
+        return 1;
+    }
 
     hello_world();
 
