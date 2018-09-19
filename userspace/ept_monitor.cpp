@@ -62,7 +62,7 @@ int main()
 {
     // Set affinity.
     //
-    // set_affinity(0);
+    set_affinity(0);
 
     // Registers for VMCall
     //
@@ -99,9 +99,6 @@ int main()
         return 1;
     }
 
-    hello_world();
-    auto* str = testString.data();
-    str[0] = 'd';
     hello_world();
 
     regs.r02 = 4;

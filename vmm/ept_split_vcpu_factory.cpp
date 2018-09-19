@@ -58,22 +58,22 @@ public:
 
     struct SplitContext {
         bool enabled{};
-        uintptr_t gva4k{};
+        uintptr_t cleanPhys{};
 
         std::reference_wrapper<ept::mmap::entry_type> pte{g_dummyPte};
-        uintptr_t cleanPhys{};
         uintptr_t shadowPhys{};
         uintptr_t shadowVirt{};
+        uintptr_t cleanVirt{};
 
         size_t refCount{};
         uint64_t cr3{};
         std::unique_ptr<uint8_t[]> shadowPage{nullptr};
     };
 
-    SplitContext* getContext(const uintptr_t gva4k) noexcept {
+    SplitContext* getContext(const uintptr_t gpa4k) noexcept {
         for (auto it = m_splitContexts.begin();
             it != m_splitContexts.end(); ++it) {
-            if (it->enabled && (it->gva4k == gva4k)) return it;
+            if (it->enabled && (it->cleanPhys == gpa4k)) return it;
         }
 
         return nullptr;
@@ -83,7 +83,7 @@ public:
         for (auto it = m_splitContexts.begin();
             it != m_splitContexts.end(); ++it) {
             if (!it->enabled) {
-                it->gva4k = 0ull;
+                it->cleanPhys = 0ull;
                 it->enabled = true;
                 return it;
             }
@@ -190,19 +190,15 @@ class Vcpu : public eapis::intel_x64::vcpu
     // Sets the physical address and access bits for
     // the provided split context.
     //
-    void flipPage(
-        SplitPool::SplitContext* ctx, const PageT flipTo) noexcept
-    {
+    void flipPage(SplitPool::SplitContext* ctx, const PageT flipTo) noexcept {
         if (flipTo == PageT::clean)
         { writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::read_write); }
         else
         { writePte(ctx->pte.get(), ctx->shadowPhys, AccessBitsT::execute); }
     }
 
-    void flipPage(
-        uintptr_t gva4k, const PageT flipTo) noexcept
-    {
-        flipPage(g_splits.getContext(gva4k), flipTo);
+    void flipPage(uintptr_t gpa4k, const PageT flipTo) noexcept {
+        flipPage(g_splits.getContext(gpa4k), flipTo);
     }
 
     // For thrashing detection.
@@ -373,24 +369,23 @@ public:
     bool ept_read_violation_handler(gsl::not_null<vmcs_t *> vmcs, ept_violation_handler::info_t &info) {
         const auto gva = vmcs_n::guest_linear_address::get();
         const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
+        const auto cr3 = vmcs_n::guest_cr3::get();
+        const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
 
         bfdebug_transaction(VIOLATION_EXIT_LVL, [&](std::string* msg) {
-            const auto cr3 = vmcs_n::guest_cr3::get();
-
             bfdebug_info(0, "read: violation", msg);
             bfdebug_subnhex(0, "rip", vmcs->save_state()->rip, msg);
             bfdebug_subnhex(0, "gva", gva, msg);
-            bfdebug_subnhex(0, "gva4k", gva4k, msg);
+            bfdebug_subnhex(0, "gpa4k", gpa4k, msg);
             bfdebug_subnhex(0, "cr3", cr3, msg);
         });
 
         // Check if there is a split context for the requested page.
         //
-        if (auto* ctx = g_splits.getContext(gva4k); ctx != nullptr)
+        if (auto* ctx = g_splits.getContext(gpa4k); ctx != nullptr)
         {
             // Check if the read violation occurred in the same CR3 context.
             //
-            const auto cr3 = vmcs_n::guest_cr3::get();
             if (ctx->cr3 == cr3) {
                 // Check for thrashing.
                 //
@@ -422,25 +417,25 @@ public:
                 // Deactivate the split context, since it seems like the
                 // application changed.
                 //
-                deactivateSplitImlp(ctx);
+                deactivateSplitImpl(ctx);
             }
         } else {
-            bfalert_nhex(ALERT_LVL, "read: no split context found", gva4k);
+            bfalert_nhex(ALERT_LVL, "read: no split context found", gpa4k);
 
             // Get page table entry.
             //
-            std::reference_wrapper<ept::mmap::entry_type> entry = g_mainMap.entry(gva4k);
+            std::reference_wrapper<ept::mmap::entry_type> entry = g_mainMap.entry(gpa4k);
 
             // Check page granularity.
             //
-            if (g_mainMap.is_4k(entry)) {
+            if (g_mainMap.is_4k(gpa4k)) {
                 using namespace ::intel_x64::ept::pt::entry;
 
                 // Check for outdated access bits.
                 //
                 if (!read_access::is_enabled(entry))
                 {
-                    bfalert_nhex(ALERT_LVL, "read: resetting access bits for 4k entry", gva4k);
+                    bfalert_nhex(ALERT_LVL, "read: resetting access bits for 4k entry", gpa4k);
                     std::lock_guard lock{g_eptMutex};
                     writePte(entry.get(), phys_addr::get(entry), AccessBitsT::all);
                 }
@@ -451,8 +446,8 @@ public:
                 //
                 if (!read_access::is_enabled(entry))
                 {
-                    const auto gva2m = bfn::upper(gva4k, ::intel_x64::ept::pt::from);
-                    bfalert_nhex(ALERT_LVL, "read: resetting access bits for 2m entry", gva2m);
+                    const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pt::from);
+                    bfalert_nhex(ALERT_LVL, "read: resetting access bits for 2m entry", gpa2m);
                     std::lock_guard lock{g_eptMutex};
                     writePte(entry.get(), phys_addr::get(entry), AccessBitsT::all);
                 }
@@ -466,24 +461,23 @@ public:
     bool ept_write_violation_handler(gsl::not_null<vmcs_t *> vmcs, ept_violation_handler::info_t &info) {
         const auto gva = vmcs_n::guest_linear_address::get();
         const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
+        const auto cr3 = vmcs_n::guest_cr3::get();
+        const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
 
         bfdebug_transaction(VIOLATION_EXIT_LVL, [&](std::string* msg) {
-            const auto cr3 = vmcs_n::guest_cr3::get();
-
             bfdebug_info(0, "write: violation", msg);
             bfdebug_subnhex(0, "rip", vmcs->save_state()->rip, msg);
             bfdebug_subnhex(0, "gva", gva, msg);
-            bfdebug_subnhex(0, "gva4k", gva4k, msg);
+            bfdebug_subnhex(0, "gpa4k", gpa4k, msg);
             bfdebug_subnhex(0, "cr3", cr3, msg);
         });
 
         // Check if there is a split context for the requested page.
         //
-        if (auto* ctx = g_splits.getContext(gva4k); ctx != nullptr)
+        if (auto* ctx = g_splits.getContext(gpa4k); ctx != nullptr)
         {
             // Check if the write violation occurred in the same CR3 context.
             //
-            const auto cr3 = vmcs_n::guest_cr3::get();
             if (ctx->cr3 == cr3) {
                 // Check for thrashing.
                 //
@@ -515,25 +509,25 @@ public:
                 // Deactivate the split context, since it seems like the
                 // application changed.
                 //
-                deactivateSplitImlp(ctx);
+                deactivateSplitImpl(ctx);
             }
         } else {
-            bfalert_nhex(ALERT_LVL, "write: no split context found", gva4k);
+            bfalert_nhex(ALERT_LVL, "write: no split context found", gpa4k);
 
             // Get page table entry.
             //
-            std::reference_wrapper<ept::mmap::entry_type> entry = g_mainMap.entry(gva4k);
+            std::reference_wrapper<ept::mmap::entry_type> entry = g_mainMap.entry(gpa4k);
 
             // Check page granularity.
             //
-            if (g_mainMap.is_4k(entry)) {
+            if (g_mainMap.is_4k(gpa4k)) {
                 using namespace ::intel_x64::ept::pt::entry;
 
                 // Check for outdated access bits.
                 //
                 if (!write_access::is_enabled(entry))
                 {
-                    bfalert_nhex(ALERT_LVL, "write: resetting access bits for 4k entry", gva4k);
+                    bfalert_nhex(ALERT_LVL, "write: resetting access bits for 4k entry", gpa4k);
                     std::lock_guard lock{g_eptMutex};
                     writePte(entry.get(), phys_addr::get(entry), AccessBitsT::all);
                 }
@@ -544,8 +538,8 @@ public:
                 //
                 if (!write_access::is_enabled(entry))
                 {
-                    const auto gva2m = bfn::upper(gva4k, ::intel_x64::ept::pt::from);
-                    bfalert_nhex(ALERT_LVL, "write: resetting access bits for 2m entry", gva2m);
+                    const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pt::from);
+                    bfalert_nhex(ALERT_LVL, "write: resetting access bits for 2m entry", gpa2m);
                     std::lock_guard lock{g_eptMutex};
                     writePte(entry.get(), phys_addr::get(entry), AccessBitsT::all);
                 }
@@ -559,24 +553,23 @@ public:
     bool ept_execute_violation_handler(gsl::not_null<vmcs_t *> vmcs, ept_violation_handler::info_t &info) {
         const auto gva = vmcs_n::guest_linear_address::get();
         const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
+        const auto cr3 = vmcs_n::guest_cr3::get();
+        const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
 
         bfdebug_transaction(VIOLATION_EXIT_LVL, [&](std::string* msg) {
-            const auto cr3 = vmcs_n::guest_cr3::get();
-
             bfdebug_info(0, "exec: violation", msg);
             bfdebug_subnhex(0, "rip", vmcs->save_state()->rip, msg);
             bfdebug_subnhex(0, "gva", gva, msg);
-            bfdebug_subnhex(0, "gva4k", gva4k, msg);
+            bfdebug_subnhex(0, "gpa4k", gpa4k, msg);
             bfdebug_subnhex(0, "cr3", cr3, msg);
         });
 
         // Check if there is a split context for the requested page.
         //
-        if (auto* ctx = g_splits.getContext(gva4k); ctx != nullptr)
+        if (auto* ctx = g_splits.getContext(gpa4k); ctx != nullptr)
         {
             // Check if the exec violation occurred in the same CR3 context.
             //
-            const auto cr3 = vmcs_n::guest_cr3::get();
             if (ctx->cr3 == cr3) {
                 // Check for thrashing.
                 //
@@ -598,7 +591,7 @@ public:
                     // Flip to clean page.
                     //
                     std::lock_guard lock{g_eptMutex};
-                    flipPage(ctx, PageT::shadow);
+                    flipPage(ctx, PageT::clean);
                 }
             }
             else
@@ -608,25 +601,25 @@ public:
                 // Deactivate the split context, since it seems like the
                 // application changed.
                 //
-                deactivateSplitImlp(ctx);
+                deactivateSplitImpl(ctx);
             }
         } else {
-            bfalert_nhex(ALERT_LVL, "exec: no split context found", gva4k);
+            bfalert_nhex(ALERT_LVL, "exec: no split context found", gpa4k);
 
             // Get page table entry.
             //
-            std::reference_wrapper<ept::mmap::entry_type> entry = g_mainMap.entry(gva4k);
+            std::reference_wrapper<ept::mmap::entry_type> entry = g_mainMap.entry(gpa4k);
 
             // Check page granularity.
             //
-            if (g_mainMap.is_4k(entry)) {
+            if (g_mainMap.is_4k(gpa4k)) {
                 using namespace ::intel_x64::ept::pt::entry;
 
                 // Check for outdated access bits.
                 //
                 if (!execute_access::is_enabled(entry))
                 {
-                    bfalert_nhex(ALERT_LVL, "exec: resetting access bits for 4k entry", gva4k);
+                    bfalert_nhex(ALERT_LVL, "exec: resetting access bits for 4k entry", gpa4k);
                     std::lock_guard lock{g_eptMutex};
                     writePte(entry.get(), phys_addr::get(entry), AccessBitsT::all);
                 }
@@ -637,8 +630,8 @@ public:
                 //
                 if (!execute_access::is_enabled(entry))
                 {
-                    const auto gva2m = bfn::upper(gva4k, ::intel_x64::ept::pt::from);
-                    bfalert_nhex(ALERT_LVL, "exec: resetting access bits for 2m entry", gva2m);
+                    const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pt::from);
+                    bfalert_nhex(ALERT_LVL, "exec: resetting access bits for 2m entry", gpa2m);
                     std::lock_guard lock{g_eptMutex};
                     writePte(entry.get(), phys_addr::get(entry), AccessBitsT::all);
                 }
@@ -671,7 +664,7 @@ private:
     // This function returns 1 to the caller
     // to indicate that the HV is present.
     //
-    uint64_t hvPresent() const noexcept { return 1ull; }
+    uint64_t hvPresent() const noexcept { return 0ull; }
 
     // This function returns 1 to the caller
     // to indicate that the split got activated.
@@ -694,39 +687,39 @@ private:
         // the relevant 4k page.
         //
         const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
-        if (auto* ctx = g_splits.getContext(gva4k); ctx != nullptr) {
+        const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
+        if (auto* ctx = g_splits.getContext(gpa4k); ctx != nullptr) {
             // Since we already have a split for the requested gva,
             // we will just increase the refCounter.
             //
             g_splits.incCounter(ctx);
 
             bfdebug_transaction(DEBUG_LVL, [&](std::string* msg) {
-                bfdebug_nhex(0, "create: increased refCount", gva4k);
+                bfdebug_nhex(0, "create: increased refCount", gpa4k);
                 bfdebug_subndec(0, "refCount", ctx->refCount, msg);
             });
         } else {
             // We don't seem to have a split for the requested gva,
             // check whether we have to remap the relevant 2m page range.
             //
-            const auto gva2m = bfn::upper(gva, ::intel_x64::ept::pd::from);
-            if (g_mainMap.is_2m(gva2m)) {
-                bfdebug_nhex(DEBUG_LVL, "create: remapping 2m page range to 4k", gva2m);
+            const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pd::from);
+            if (g_mainMap.is_2m(gpa2m)) {
+                bfdebug_nhex(DEBUG_LVL, "create: remapping 2m page range to 4k", gpa2m);
                 // We need to remap the relevant 2m page range
                 // to 4k granularity.
                 //
                 std::lock_guard lock{g_eptMutex};
-                ept::identity_map_convert_2m_to_4k(g_mainMap, gva2m);
+                ept::identity_map_convert_2m_to_4k(g_mainMap, gpa2m);
                 ::intel_x64::vmx::invept_global();  // necessary?
             }
 
             // Ask for a free context which we can configure.
             //
             if (auto* ctx = g_splits.getFreeContext(); ctx != nullptr) {
-                bfdebug_nhex(DEBUG_LVL, "create: creating split context", gva4k);
+                bfdebug_nhex(DEBUG_LVL, "create: creating split context", gpa4k);
 
-                const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
                 ctx->cleanPhys = gpa4k;
-                ctx->gva4k = gva4k;
+                ctx->cleanVirt = gva4k;
                 ctx->cr3 = cr3;
                 ctx->pte = g_mainMap.entry(gva);
 
@@ -762,14 +755,15 @@ private:
 
                 bfdebug_transaction(SPLIT_CONTEXT_LVL, [&](std::string* msg) {
                     bfdebug_info(0, "create: new split context", msg);
-                    bfdebug_subnhex(0, "gva4k", gva4k, msg);
-                    bfdebug_subndec(0, "refCount", ctx->refCount, msg);
+                    bfdebug_subnhex(0, "cleanPhys", gpa4k, msg);
+                    bfdebug_subnhex(0, "cleanVirt", gva4k, msg);
+                    bfdebug_subnhex(0, "shadowPhys", ctx->shadowPhys, msg);;
                     bfdebug_subnhex(0, "shadowVirt", ctx->shadowVirt, msg);
-                    bfdebug_subnhex(0, "shadowPhys", ctx->shadowPhys, msg);
+                    bfdebug_subndec(0, "refCount", ctx->refCount, msg)
                     bfdebug_subnhex(0, "cr3", cr3, msg);
                 });
             } else {
-                bferror_nhex(ERROR_LVL, "create: no free context available", gva4k);
+                bferror_nhex(ERROR_LVL, "create: no free context available", gpa4k);
                 return 0ull;
             }
         }
@@ -780,7 +774,7 @@ private:
     // This function will deactivate (and free) a split context
     // for the give guest physical address (4k aligned).
     //
-    uint64_t deactivateSplitImlp(SplitPool::SplitContext* ctx) {
+    uint64_t deactivateSplitImpl(SplitPool::SplitContext* ctx) {
         // Check if the reference count is greater than 0.
         //
         if (g_splits.decCounter(ctx) > 0ull)
@@ -788,14 +782,15 @@ private:
 
         bfdebug_transaction(SPLIT_CONTEXT_LVL, [&](std::string* msg) {
             bfdebug_info(0, "deactivate: deactivating split context", msg);
-            bfdebug_subnhex(0, "gva4k", ctx->gva4k, msg);
-            bfdebug_subndec(0, "refCount", ctx->refCount, msg);
+            bfdebug_subnhex(0, "cleanPhys", ctx->cleanPhys, msg);
+            bfdebug_subnhex(0, "cleanVirt", ctx->cleanVirt, msg);
+            bfdebug_subnhex(0, "shadowPhys", ctx->shadowPhys, msg);;
             bfdebug_subnhex(0, "shadowVirt", ctx->shadowVirt, msg);
-            bfdebug_subnhex(0, "shadowPhys", ctx->shadowPhys, msg);
+            bfdebug_subndec(0, "refCount", ctx->refCount, msg)
             bfdebug_subnhex(0, "cr3", ctx->cr3, msg);
         });
 
-        bfdebug_nhex(DEBUG_LVL, "deactivate: deactivating split context", ctx->gva4k);
+        bfdebug_nhex(DEBUG_LVL, "deactivate: deactivating split context", ctx->cleanPhys);
         // Since we are the last one to use the split context,
         // we should be able to safely disable this split context.
         // We will first flip to the clean page and then restore
@@ -807,30 +802,32 @@ private:
             writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
             ::intel_x64::vmx::invept_global();
         }
-        const auto gva4k = ctx->gva4k;
+        const auto gpa4k = ctx->cleanPhys;
         ctx->enabled = false;
         ctx->shadowPage = nullptr;
 
         // Check if there are any more splits for the relevant
         // 2m page range.
         //
-        const auto gva2mStart = bfn::upper(gva4k, ::intel_x64::ept::pd::from);
-        const auto gva2mEnd = gva2mStart + ::intel_x64::ept::pd::page_size;
+        const auto gpa2mStart = bfn::upper(gpa4k, ::intel_x64::ept::pd::from);
+        const auto gpa2mEnd = gpa2mStart + ::intel_x64::ept::pd::page_size;
         for (auto i = 0; i < MAX_SPLITS; ++i) {
             const auto* temp = g_splits.getContextByIndex(i);
-            if (temp->enabled && temp->gva4k >= gva2mStart && temp->gva4k < gva2mEnd)
+            if (temp->enabled
+                && temp->cleanPhys >= gpa2mStart
+                && temp->cleanPhys < gpa2mEnd)
                 return 1ull;
         }
 
-        bfdebug_nhex(DEBUG_LVL, "deactivate: remapping 2m page range to 2m", gva2mStart);
+        bfdebug_nhex(DEBUG_LVL, "deactivate: remapping 2m page range to 2m", gpa2mStart);
         // Since there are no more splits for the relevant 2m
         // page range, we will remap the range back from 4k to
         // 2m granularity.
         //
         {
             std::lock_guard lock{g_eptMutex};
-            ept::identity_map_convert_4k_to_2m(g_mainMap, gva2mStart);
-            auto& entry = g_mainMap.entry(gva2mStart);
+            ept::identity_map_convert_4k_to_2m(g_mainMap, gpa2mStart);
+            auto& entry = g_mainMap.entry(gpa2mStart);
             writePte(entry, ::intel_x64::ept::pd::entry::phys_addr::get(entry), AccessBitsT::all, pteMask2m);
             ::intel_x64::vmx::invept_global();
         }
@@ -846,12 +843,13 @@ private:
         // Check whether there is a split for the relevant 4k page.
         //
         const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
-        if (auto* ctx = g_splits.getContext(gva4k); ctx != nullptr) {
+        const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
+        if (auto* ctx = g_splits.getContext(gpa4k); ctx != nullptr) {
             // Call implementation.
             //
-            return deactivateSplitImlp(ctx);
+            return deactivateSplitImpl(ctx);
         } else {
-            bfalert_nhex(ALERT_LVL, "deactivate: no split context found", gva4k);
+            bfalert_nhex(ALERT_LVL, "deactivate: no split context found", gpa4k);
             return 0ull;
         }
     }
@@ -864,7 +862,7 @@ private:
 
         SplitPool::SplitContext* temp = g_splits.getFirstEnabledContext();
         while (temp != nullptr) {
-            deactivateSplitImlp(temp);
+            deactivateSplitImpl(temp);
             temp = g_splits.getFirstEnabledContext();
         }
 
@@ -876,7 +874,8 @@ private:
     //
     uint64_t isSplit(const uintptr_t gva, const uint64_t cr3) noexcept {
         const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
-        return g_splits.getContext(gva4k) != nullptr;
+        const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
+        return g_splits.getContext(gpa4k) != nullptr;
     }
 
     // This function will copy the given memory range from the guest memory
@@ -884,17 +883,18 @@ private:
     //
     uint64_t writeMemory(const uintptr_t srcGva, const uintptr_t dstGva, const size_t len, const uint64_t cr3) {
         const auto dstGva4k = bfn::upper(dstGva, ::intel_x64::ept::pt::from);
+        const auto dstGpa4k = bfvmm::x64::virt_to_phys_with_cr3(dstGva4k, cr3);
 
         // Check whether there is a split for the relevant 4k page.
         //
-        if (auto* ctx = g_splits.getContext(dstGva4k); ctx != nullptr) {
+        if (auto* ctx = g_splits.getContext(dstGpa4k); ctx != nullptr) {
             // Check if we have to write to two consecutive pages.
             //
             const auto dstGvaEnd = dstGva + len - 1;
             const auto dstGvaEnd4k = bfn::upper(dstGvaEnd, ::intel_x64::ept::pt::from);
             if (dstGva4k == dstGvaEnd4k)
             {
-                bfdebug_nhex(DEBUG_LVL, "writeMemory: writing to 1 page", dstGva4k);
+                bfdebug_nhex(DEBUG_LVL, "writeMemory: writing to 1 page", dstGpa4k);
 
                 // Calculate the offset from the start of the page.
                 //
@@ -912,14 +912,16 @@ private:
                     len
                 );
             } else {
-                bfdebug_nhex(DEBUG_LVL, "writeMemory: writing to 2 pages", dstGva4k);
+                bfdebug_nhex(DEBUG_LVL, "writeMemory: writing to 2 pages", dstGpa4k);
 
                 // Check if we already have a split context for the second page.
                 // If not, create one.
                 //
-                if (auto* ctx2 = g_splits.getContext(dstGvaEnd4k); ctx2 == nullptr) {
-                    if (createSplitContext(dstGvaEnd4k, cr3) != 1ull) {
-                        bferror_nhex(ERROR_LVL, "writeMemory: failed to create split context", dstGvaEnd4k);
+                const auto dstGpaEnd = dstGpa4k + len - 1;
+                const auto dstGpaEnd4k = bfn::upper(dstGpaEnd, ::intel_x64::ept::pt::from);
+                if (auto* ctx2 = g_splits.getContext(dstGpaEnd4k); ctx2 == nullptr) {
+                    if (createSplitContext(dstGpaEnd4k, cr3) != 1ull) {
+                        bferror_nhex(ERROR_LVL, "writeMemory: failed to create split context", dstGpaEnd4k);
                         return 0ull;
                     }
                 } else {
@@ -966,7 +968,7 @@ private:
                 }
             }
         } else {
-            bfalert_nhex(ALERT_LVL, "writeMemory: no split context found", dstGva4k);
+            bfalert_nhex(ALERT_LVL, "writeMemory: no split context found", dstGpa4k);
             return 0ull;
         }
 
