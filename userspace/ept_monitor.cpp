@@ -70,13 +70,15 @@ int main()
 
     // Check if the HV is present.
     //
-    regs.r02 = 0;
-    _platform_vmcall(&regs);
-    if (!regs.r02)
-    {
-        std::clog << "hv not present\n";
-        return 1;
-    }
+    // regs.r02 = 0;
+    // _platform_vmcall(&regs);
+    // if (!regs.r02)
+    // {
+    //     std::clog << "hv not present\n";
+    //     return 1;
+    // }
+
+    hello_world();
 
     // Create split context.
     //
@@ -101,13 +103,13 @@ int main()
 
     hello_world();
 
-    regs.r02 = 4;
-    _platform_vmcall(&regs);
-    if (!regs.r02)
-    {
-        std::clog << "somthing went wrong\n";
-        return 1;
-    }
+    // regs.r02 = 4;
+    // _platform_vmcall(&regs);
+    // if (!regs.r02)
+    // {
+    //     std::clog << "somthing went wrong\n";
+    //     return 1;
+    // }
 
     hello_world();
 

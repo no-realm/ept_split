@@ -16,11 +16,11 @@ using namespace eapis::intel_x64;
 
 // Macros for defining print levels.
 //
-#define VIOLATION_EXIT_LVL  0
-#define SPLIT_CONTEXT_LVL   0
-#define MONITOR_TRAP_LVL    0
-#define DEBUG_LVL           0
-#define ALERT_LVL           0
+#define VIOLATION_EXIT_LVL  1
+#define SPLIT_CONTEXT_LVL   1
+#define MONITOR_TRAP_LVL    1
+#define DEBUG_LVL           1
+#define ALERT_LVL           1
 #define ERROR_LVL           0
 
 // -----------------------------------------------------------------------------
@@ -206,6 +206,11 @@ class Vcpu : public eapis::intel_x64::vcpu
     uintptr_t m_prevRip{};
     size_t m_ripCounter{};
 
+    // For resetting the access bits
+    // after setting the monitor trap.
+    //
+    SplitPool::SplitContext* m_trapCtx{nullptr};
+
 public:
 
     // Constructor
@@ -322,7 +327,7 @@ public:
                 // write_to_shadow_page(int_t from_va, int_t to_va, size_t size)
                 case 6ull:
                 {
-                    state->rcx = writeMemory(state->rbx, state->rbx, state->rsi, vmcs_n::guest_cr3::get());
+                    state->rcx = writeMemory(state->rbx, state->rsi, state->r08, vmcs_n::guest_cr3::get());
                     break;
                 }
 
@@ -384,40 +389,28 @@ public:
         //
         if (auto* ctx = g_splits.getContext(gpa4k); ctx != nullptr)
         {
-            // Check if the read violation occurred in the same CR3 context.
+            // Check for thrashing.
             //
-            if (ctx->cr3 == cr3) {
-                // Check for thrashing.
+            if (vmcs->save_state()->rip == m_prevRip && ctx->cr3 == cr3) { m_ripCounter++; }
+            else { m_prevRip = vmcs->save_state()->rip; m_ripCounter = 1; }
+
+            if (m_ripCounter > 4)
+            {
+                bfalert_nhex(ALERT_LVL, "read: thrashing detected", m_prevRip);
+                m_ripCounter = 1;
+
+                // Enable monitor trap flag for single stepping.
                 //
-                if (vmcs->save_state()->rip == m_prevRip) { m_ripCounter++; }
-                else { m_prevRip = vmcs->save_state()->rip; m_ripCounter = 1; }
-
-                if (m_ripCounter > 4)
-                {
-                    bfalert_nhex(ALERT_LVL, "read: thrashing detected", m_prevRip);
-                    m_ripCounter = 1;
-
-                    // Enable monitor trap flag for single stepping.
-                    //
-                    eapis()->set_eptp(g_trapMap);
-                    eapis()->enable_monitor_trap_flag();
-                }
-                else
-                {
-                    // Flip to clean page.
-                    //
-                    std::lock_guard lock{g_eptMutex};
-                    flipPage(ctx, PageT::clean);
-                }
+                m_trapCtx = ctx;
+                writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
+                eapis()->enable_monitor_trap_flag();
             }
             else
             {
-                bfalert_nhex(ALERT_LVL, "read: different cr3", cr3);
-
-                // Deactivate the split context, since it seems like the
-                // application changed.
+                // Flip to clean page.
                 //
-                deactivateSplitImpl(ctx);
+                std::lock_guard lock{g_eptMutex};
+                flipPage(ctx, PageT::clean);
             }
         } else {
             bfalert_nhex(ALERT_LVL, "read: no split context found", gpa4k);
@@ -491,7 +484,8 @@ public:
 
                     // Enable monitor trap flag for single stepping.
                     //
-                    eapis()->set_eptp(g_trapMap);
+                    m_trapCtx = ctx;
+                    writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
                     eapis()->enable_monitor_trap_flag();
                 }
                 else
@@ -583,7 +577,8 @@ public:
 
                     // Enable monitor trap flag for single stepping.
                     //
-                    eapis()->set_eptp(g_trapMap);
+                    m_trapCtx = ctx;
+                    writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
                     eapis()->enable_monitor_trap_flag();
                 }
                 else
@@ -591,7 +586,7 @@ public:
                     // Flip to clean page.
                     //
                     std::lock_guard lock{g_eptMutex};
-                    flipPage(ctx, PageT::clean);
+                    flipPage(ctx, PageT::shadow);
                 }
             }
             else
@@ -653,7 +648,10 @@ public:
         bfignored(info);
 
         bfdebug_info(MONITOR_TRAP_LVL, "monitor trap");
-        eapis()->set_eptp(g_mainMap);
+
+        // Flip back to shadow page.
+        //
+        flipPage(m_trapCtx, PageT::shadow);
         ::intel_x64::vmx::invept_global();
 
         return true;
@@ -664,7 +662,7 @@ private:
     // This function returns 1 to the caller
     // to indicate that the HV is present.
     //
-    uint64_t hvPresent() const noexcept { return 0ull; }
+    uint64_t hvPresent() const noexcept { return 1ull; }
 
     // This function returns 1 to the caller
     // to indicate that the split got activated.
@@ -721,7 +719,7 @@ private:
                 ctx->cleanPhys = gpa4k;
                 ctx->cleanVirt = gva4k;
                 ctx->cr3 = cr3;
-                ctx->pte = g_mainMap.entry(gva);
+                ctx->pte = g_mainMap.entry(gpa4k);
 
                 // Allocate memory for the shadow page.
                 //
@@ -885,6 +883,13 @@ private:
         const auto dstGva4k = bfn::upper(dstGva, ::intel_x64::ept::pt::from);
         const auto dstGpa4k = bfvmm::x64::virt_to_phys_with_cr3(dstGva4k, cr3);
 
+        bfdebug_transaction(DEBUG_LVL, [&](std::string* msg) {
+            bfdebug_info(0, "writeMemory: debug", msg);
+            bfdebug_subnhex(0, "srcGva", srcGva, msg);
+            bfdebug_subnhex(0, "dstGva", dstGva, msg);
+            bfdebug_subnhex(0, "len", len, msg);
+        });
+
         // Check whether there is a split for the relevant 4k page.
         //
         if (auto* ctx = g_splits.getContext(dstGpa4k); ctx != nullptr) {
@@ -914,13 +919,25 @@ private:
             } else {
                 bfdebug_nhex(DEBUG_LVL, "writeMemory: writing to 2 pages", dstGpa4k);
 
+                bfdebug_transaction(DEBUG_LVL, [&](std::string* msg) {
+                    bfdebug_info(0, "writeMemory: debug", msg);
+                    bfdebug_subnhex(0, "dstGva4k", dstGva4k, msg);
+                    bfdebug_subnhex(0, "dstGvaEnd4k", dstGvaEnd4k, msg);
+                    bfdebug_subnhex(0, "dstGpa4k", dstGpa4k, msg);
+                    // bfdebug_subnhex(0, "dstGpaEnd4k", dstGpaEnd4k, msg);
+                    bfdebug_subnhex(0, "dstGvaEnd", dstGvaEnd, msg);
+                    bfdebug_subndec(0, "len", len, msg);
+                });
+
                 // Check if we already have a split context for the second page.
                 // If not, create one.
                 //
-                const auto dstGpaEnd = dstGpa4k + len - 1;
-                const auto dstGpaEnd4k = bfn::upper(dstGpaEnd, ::intel_x64::ept::pt::from);
+                const auto dstGpaEnd4k = bfvmm::x64::virt_to_phys_with_cr3(dstGvaEnd4k, cr3);
+
+                bfdebug_subnhex(0, "dstGpaEnd4k", dstGpaEnd4k);
+
                 if (auto* ctx2 = g_splits.getContext(dstGpaEnd4k); ctx2 == nullptr) {
-                    if (createSplitContext(dstGpaEnd4k, cr3) != 1ull) {
+                    if (createSplitContext(dstGvaEnd4k, cr3) != 1ull) {
                         bferror_nhex(ERROR_LVL, "writeMemory: failed to create split context", dstGpaEnd4k);
                         return 0ull;
                     }
