@@ -202,16 +202,6 @@ class Vcpu : public eapis::intel_x64::vcpu
         flipPage(g_splits.getContext(gpa4k), flipTo);
     }
 
-    // For thrashing detection.
-    //
-    uintptr_t m_prevRip{};
-    size_t m_ripCounter{};
-
-    // For resetting the access bits
-    // after setting the monitor trap.
-    //
-    SplitPool::SplitContext* m_trapCtx{nullptr};
-
 public:
 
     // Constructor
@@ -402,9 +392,6 @@ public:
 
                 // Enable monitor trap flag for single stepping.
                 //
-                // m_trapCtx = ctx;
-                // writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
-
                 eapis()->set_eptp(g_trapMap);
                 eapis()->enable_monitor_trap_flag();
             }
@@ -496,9 +483,6 @@ public:
 
                     // Enable monitor trap flag for single stepping.
                     //
-                    // m_trapCtx = ctx;
-                    // writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
-
                     eapis()->set_eptp(g_trapMap);
                     eapis()->enable_monitor_trap_flag();
                 }
@@ -600,9 +584,6 @@ public:
 
                     // Enable monitor trap flag for single stepping.
                     //
-                    // m_trapCtx = ctx;
-                    // writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
-
                     eapis()->set_eptp(g_trapMap);
                     eapis()->enable_monitor_trap_flag();
                 }
@@ -678,14 +659,13 @@ public:
     bool monitor_trap_handler(
         gsl::not_null<vmcs_t *> vmcs, monitor_trap_handler::info_t &info)
     {
-        bfignored(vmcs);
         bfignored(info);
 
-        // Flip back to shadow page.
-        //
-        // flipPage(m_trapCtx, PageT::shadow);
         bfalert_nhex(THRASHING_LVL, "trap: rip", vmcs->save_state()->rip);
+        // Revert back to the main memory map.
+        //
         eapis()->set_eptp(g_mainMap);
+        ::intel_x64::vmx::invept_global();
         return true;
     }
 
