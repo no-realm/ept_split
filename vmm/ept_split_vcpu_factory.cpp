@@ -202,6 +202,11 @@ class Vcpu : public eapis::intel_x64::vcpu
         flipPage(g_splits.getContext(gpa4k), flipTo);
     }
 
+    // For thrashing detection.
+    //
+    uintptr_t m_prevRip{};
+    size_t m_ripCounter{};
+
 public:
 
     // Constructor
