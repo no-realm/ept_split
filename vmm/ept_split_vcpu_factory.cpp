@@ -17,7 +17,9 @@ using namespace eapis::intel_x64;
 #define SPLIT_CONTEXT_LVL   1
 #define MONITOR_TRAP_LVL    1
 #define THRASHING_LVL       0
+#define ACCESS_BITS_LVL     1
 #define WRITE_LVL           1
+
 #define DEBUG_LVL           0
 #define ALERT_LVL           0
 #define ERROR_LVL           0
@@ -402,6 +404,7 @@ public:
                 //
                 // m_trapCtx = ctx;
                 // writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
+                bfalert_nhex(THRASHING_LVL, "read: rip", vmcs->save_state()->rip);
                 eapis()->set_eptp(g_trapMap);
                 eapis()->enable_monitor_trap_flag();
             }
@@ -412,12 +415,14 @@ public:
                 std::lock_guard lock{g_eptMutex};
                 flipPage(ctx, PageT::clean);
 
+                #if DEBUG_LEVEL > ACCESS_BITS_LVL
                 if (::intel_x64::ept::pt::entry::execute_access::is_enabled(ctx->pte))
-                    bferror_nhex(0, "read: exec not disabled", gpa4k);
+                    bferror_nhex(ERROR_LVL, "read: exec not disabled", gpa4k);
                 if (::intel_x64::ept::pt::entry::read_access::is_disabled(ctx->pte))
-                    bferror_nhex(0, "read: read not enabled", gpa4k);
+                    bferror_nhex(ERROR_LVL, "read: read not enabled", gpa4k);
                 if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte))
-                    bferror_nhex(0, "read: write not enabled", gpa4k);
+                    bferror_nhex(ERROR_LVL, "read: write not enabled", gpa4k);
+                #endif
             }
         } else {
             bfalert_nhex(ALERT_LVL, "read: no split context found", gpa4k);
@@ -493,6 +498,7 @@ public:
                     //
                     // m_trapCtx = ctx;
                     // writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
+                    bfalert_nhex(THRASHING_LVL, "write: rip", vmcs->save_state()->rip);
                     eapis()->set_eptp(g_trapMap);
                     eapis()->enable_monitor_trap_flag();
                 }
@@ -503,12 +509,14 @@ public:
                     std::lock_guard lock{g_eptMutex};
                     flipPage(ctx, PageT::clean);
 
+                    #if DEBUG_LEVEL > ACCESS_BITS_LVL
                     if (::intel_x64::ept::pt::entry::execute_access::is_enabled(ctx->pte))
-                        bferror_nhex(0, "write: exec not disabled", gpa4k);
+                        bferror_nhex(ERROR_LVL, "write: exec not disabled", gpa4k);
                     if (::intel_x64::ept::pt::entry::read_access::is_disabled(ctx->pte))
-                        bferror_nhex(0, "write: read not enabled", gpa4k);
+                        bferror_nhex(ERROR_LVL, "write: read not enabled", gpa4k);
                     if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte))
-                        bferror_nhex(0, "write: write not enabled", gpa4k);
+                        bferror_nhex(ERROR_LVL, "write: write not enabled", gpa4k);
+                    #endif
                 }
             }
             else
@@ -592,10 +600,11 @@ public:
 
                     // Enable monitor trap flag for single stepping.
                     //
-                    m_trapCtx = ctx;
-                    eapis()->set_eptp(g_trapMap);
+                    // m_trapCtx = ctx;
                     // writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
-                    // eapis()->enable_monitor_trap_flag();
+                    bfalert_nhex(THRASHING_LVL, "exec: rip", vmcs->save_state()->rip);
+                    eapis()->set_eptp(g_trapMap);
+                    eapis()->enable_monitor_trap_flag();
                 }
                 else
                 {
@@ -604,12 +613,14 @@ public:
                     std::lock_guard lock{g_eptMutex};
                     flipPage(ctx, PageT::shadow);
 
+                    #if DEBUG_LEVEL > ACCESS_BITS_LVL
                     if (::intel_x64::ept::pt::entry::execute_access::is_disabled(ctx->pte))
-                        bferror_nhex(0, "exec: exec not enabled", gpa4k);
+                        bferror_nhex(ERROR_LVL, "exec: exec not enabled", gpa4k);
                     if (::intel_x64::ept::pt::entry::read_access::is_enabled(ctx->pte))
-                        bferror_nhex(0, "exec: read not disabled", gpa4k);
+                        bferror_nhex(ERROR_LVL, "exec: read not disabled", gpa4k);
                     if (::intel_x64::ept::pt::entry::write_access::is_enabled(ctx->pte))
-                        bferror_nhex(0, "exec: write not disabled", gpa4k);
+                        bferror_nhex(ERROR_LVL, "exec: write not disabled", gpa4k);
+                    #endif
                 }
             }
             else
@@ -670,13 +681,15 @@ public:
         bfignored(vmcs);
         bfignored(info);
 
-        bfdebug_info(MONITOR_TRAP_LVL, "monitor trap");
+        // bfdebug_info(MONITOR_TRAP_LVL, "monitor trap");
 
         // Flip back to shadow page.
         //
         // flipPage(m_trapCtx, PageT::shadow);
+        bfalert_nhex(THRASHING_LVL, "trap: rip", vmcs->save_state()->rip);
+
         eapis()->set_eptp(g_mainMap);
-        ::intel_x64::vmx::invept_global();
+        // ::intel_x64::vmx::invept_global();
 
         return true;
     }
@@ -914,11 +927,11 @@ private:
         const auto dstGva4k = bfn::upper(dstGva, ::intel_x64::ept::pt::from);
         const auto dstGpa4k = bfvmm::x64::virt_to_phys_with_cr3(dstGva4k, cr3);
 
-        bfdebug_transaction(WRITE_LVL, [&](std::string* msg) {
-            bferror_info(0, "writeMemory: arguments", msg);
-            bferror_subnhex(0, "srcGva", srcGva, msg);
-            bferror_subnhex(0, "dstGva", dstGva, msg);
-            bferror_subndec(0, "len", len, msg);
+        bfdebug_transaction(/*WRITE_LVL*/0, [&](std::string* msg) {
+            bfdebug_info(0, "writeMemory: arguments", msg);
+            bfdebug_subnhex(0, "srcGva", srcGva, msg);
+            bfdebug_subnhex(0, "dstGva", dstGva, msg);
+            bfdebug_subndec(0, "len", len, msg);
         });
 
         // Check whether there is a split for the relevant 4k page.
