@@ -373,17 +373,17 @@ public:
     // -----------------------------------------------------------------------------
 
     bool ept_read_violation_handler(gsl::not_null<vmcs_t *> vmcs, ept_violation_handler::info_t &info) {
-        const auto gva = vmcs_n::guest_linear_address::get();
-        const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
-        const auto cr3 = vmcs_n::guest_cr3::get();
-        const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
+        // const auto gva = vmcs_n::guest_linear_address::get();
+        // const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
+        // const auto cr3 = vmcs_n::guest_cr3::get();
+        const auto gpa4k = bfn::upper(info.gpa, ::intel_x64::ept::pt::from);
 
         bfdebug_transaction(VIOLATION_EXIT_LVL, [&](std::string* msg) {
             bfdebug_info(0, "read: violation", msg);
             bfdebug_subnhex(0, "rip", vmcs->save_state()->rip, msg);
-            bfdebug_subnhex(0, "gva", gva, msg);
+            bfdebug_subnhex(0, "gva", info.gva, msg);
             bfdebug_subnhex(0, "gpa4k", gpa4k, msg);
-            bfdebug_subnhex(0, "cr3", cr3, msg);
+            bfdebug_subnhex(0, "cr3", vmcs_n::guest_cr3::get(), msg);
         });
 
         // Check if there is a split context for the requested page.
@@ -392,7 +392,7 @@ public:
         {
             // Check for thrashing.
             //
-            if (vmcs->save_state()->rip == m_prevRip && ctx->cr3 == cr3) { m_ripCounter++; }
+            if (vmcs->save_state()->rip == m_prevRip && ctx->cr3 == vmcs_n::guest_cr3::get()) { m_ripCounter++; }
             else { m_prevRip = vmcs->save_state()->rip; m_ripCounter = 1; }
 
             if (m_ripCounter > 4)
@@ -404,7 +404,7 @@ public:
                 //
                 // m_trapCtx = ctx;
                 // writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
-                bfalert_nhex(THRASHING_LVL, "read: rip", vmcs->save_state()->rip);
+
                 eapis()->set_eptp(g_trapMap);
                 eapis()->enable_monitor_trap_flag();
             }
@@ -464,17 +464,17 @@ public:
     }
 
     bool ept_write_violation_handler(gsl::not_null<vmcs_t *> vmcs, ept_violation_handler::info_t &info) {
-        const auto gva = vmcs_n::guest_linear_address::get();
-        const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
-        const auto cr3 = vmcs_n::guest_cr3::get();
-        const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
+        // const auto gva = vmcs_n::guest_linear_address::get();
+        // const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
+        // const auto cr3 = vmcs_n::guest_cr3::get();
+        const auto gpa4k = bfn::upper(info.gpa, ::intel_x64::ept::pt::from);
 
         bfdebug_transaction(VIOLATION_EXIT_LVL, [&](std::string* msg) {
             bfdebug_info(0, "write: violation", msg);
             bfdebug_subnhex(0, "rip", vmcs->save_state()->rip, msg);
-            bfdebug_subnhex(0, "gva", gva, msg);
+            bfdebug_subnhex(0, "gva", info.gva, msg);
             bfdebug_subnhex(0, "gpa4k", gpa4k, msg);
-            bfdebug_subnhex(0, "cr3", cr3, msg);
+            bfdebug_subnhex(0, "cr3", vmcs_n::guest_cr3::get(), msg);
         });
 
         // Check if there is a split context for the requested page.
@@ -483,7 +483,7 @@ public:
         {
             // Check if the write violation occurred in the same CR3 context.
             //
-            if (ctx->cr3 == cr3) {
+            if (ctx->cr3 == vmcs_n::guest_cr3::get()) {
                 // Check for thrashing.
                 //
                 if (vmcs->save_state()->rip == m_prevRip) { m_ripCounter++; }
@@ -498,7 +498,7 @@ public:
                     //
                     // m_trapCtx = ctx;
                     // writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
-                    bfalert_nhex(THRASHING_LVL, "write: rip", vmcs->save_state()->rip);
+
                     eapis()->set_eptp(g_trapMap);
                     eapis()->enable_monitor_trap_flag();
                 }
@@ -521,7 +521,7 @@ public:
             }
             else
             {
-                bfalert_nhex(ALERT_LVL, "write: different cr3", cr3);
+                bfalert_nhex(ALERT_LVL, "write: different cr3", vmcs_n::guest_cr3::get());
 
                 // Deactivate the split context, since it seems like the
                 // application changed.
@@ -568,17 +568,17 @@ public:
     }
 
     bool ept_execute_violation_handler(gsl::not_null<vmcs_t *> vmcs, ept_violation_handler::info_t &info) {
-        const auto gva = vmcs_n::guest_linear_address::get();
-        const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
-        const auto cr3 = vmcs_n::guest_cr3::get();
-        const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
+        // const auto gva = vmcs_n::guest_linear_address::get();
+        // const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
+        // const auto cr3 = vmcs_n::guest_cr3::get();
+        const auto gpa4k = bfn::upper(info.gpa, ::intel_x64::ept::pt::from);
 
         bfdebug_transaction(VIOLATION_EXIT_LVL, [&](std::string* msg) {
             bfdebug_info(0, "exec: violation", msg);
             bfdebug_subnhex(0, "rip", vmcs->save_state()->rip, msg);
-            bfdebug_subnhex(0, "gva", gva, msg);
+            bfdebug_subnhex(0, "gva", info.gva, msg);
             bfdebug_subnhex(0, "gpa4k", gpa4k, msg);
-            bfdebug_subnhex(0, "cr3", cr3, msg);
+            bfdebug_subnhex(0, "cr3", vmcs_n::guest_cr3::get(), msg);
         });
 
         // Check if there is a split context for the requested page.
@@ -587,7 +587,7 @@ public:
         {
             // Check if the exec violation occurred in the same CR3 context.
             //
-            if (ctx->cr3 == cr3) {
+            if (ctx->cr3 == vmcs_n::guest_cr3::get()) {
                 // Check for thrashing.
                 //
                 if (vmcs->save_state()->rip == m_prevRip) { m_ripCounter++; }
@@ -602,7 +602,7 @@ public:
                     //
                     // m_trapCtx = ctx;
                     // writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
-                    bfalert_nhex(THRASHING_LVL, "exec: rip", vmcs->save_state()->rip);
+
                     eapis()->set_eptp(g_trapMap);
                     eapis()->enable_monitor_trap_flag();
                 }
@@ -625,7 +625,7 @@ public:
             }
             else
             {
-                bfalert_nhex(ALERT_LVL, "exec: different cr3", cr3);
+                bfalert_nhex(ALERT_LVL, "exec: different cr3", vmcs_n::guest_cr3::get());
 
                 // Deactivate the split context, since it seems like the
                 // application changed.
@@ -681,16 +681,11 @@ public:
         bfignored(vmcs);
         bfignored(info);
 
-        // bfdebug_info(MONITOR_TRAP_LVL, "monitor trap");
-
         // Flip back to shadow page.
         //
         // flipPage(m_trapCtx, PageT::shadow);
         bfalert_nhex(THRASHING_LVL, "trap: rip", vmcs->save_state()->rip);
-
         eapis()->set_eptp(g_mainMap);
-        // ::intel_x64::vmx::invept_global();
-
         return true;
     }
 
