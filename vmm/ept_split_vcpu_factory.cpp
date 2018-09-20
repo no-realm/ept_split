@@ -19,8 +19,9 @@ using namespace eapis::intel_x64;
 #define VIOLATION_EXIT_LVL  1
 #define SPLIT_CONTEXT_LVL   1
 #define MONITOR_TRAP_LVL    1
-#define DEBUG_LVL           1
-#define ALERT_LVL           1
+#define THRASHING_LVL       1
+#define DEBUG_LVL           0
+#define ALERT_LVL           0
 #define ERROR_LVL           0
 
 // -----------------------------------------------------------------------------
@@ -396,7 +397,7 @@ public:
 
             if (m_ripCounter > 4)
             {
-                bfalert_nhex(ALERT_LVL, "read: thrashing detected", m_prevRip);
+                bfalert_nhex(THRASHING_LVL, "read: thrashing detected", m_prevRip);
                 m_ripCounter = 1;
 
                 // Enable monitor trap flag for single stepping.
@@ -479,7 +480,7 @@ public:
 
                 if (m_ripCounter > 4)
                 {
-                    bfalert_nhex(ALERT_LVL, "write: thrashing detected", m_prevRip);
+                    bfalert_nhex(THRASHING_LVL, "write: thrashing detected", m_prevRip);
                     m_ripCounter = 1;
 
                     // Enable monitor trap flag for single stepping.
@@ -572,7 +573,7 @@ public:
 
                 if (m_ripCounter > 4)
                 {
-                    bfalert_nhex(ALERT_LVL, "exec: thrashing detected", m_prevRip);
+                    bfalert_nhex(THRASHING_LVL, "exec: thrashing detected", m_prevRip);
                     m_ripCounter = 1;
 
                     // Enable monitor trap flag for single stepping.
@@ -693,7 +694,7 @@ private:
             g_splits.incCounter(ctx);
 
             bfdebug_transaction(DEBUG_LVL, [&](std::string* msg) {
-                bfdebug_nhex(0, "create: increased refCount", gpa4k);
+                bfdebug_nhex(0, "create: increased refCount", gpa4k, msg);
                 bfdebug_subndec(0, "refCount", ctx->refCount, msg);
             });
         } else {
@@ -709,6 +710,8 @@ private:
                 std::lock_guard lock{g_eptMutex};
                 ept::identity_map_convert_2m_to_4k(g_mainMap, gpa2m);
                 ::intel_x64::vmx::invept_global();  // necessary?
+            } else {
+                bfdebug_nhex(0, "create: already remapped", gpa4k);
             }
 
             // Ask for a free context which we can configure.
@@ -884,10 +887,10 @@ private:
         const auto dstGpa4k = bfvmm::x64::virt_to_phys_with_cr3(dstGva4k, cr3);
 
         bfdebug_transaction(DEBUG_LVL, [&](std::string* msg) {
-            bfdebug_info(0, "writeMemory: debug", msg);
-            bfdebug_subnhex(0, "srcGva", srcGva, msg);
-            bfdebug_subnhex(0, "dstGva", dstGva, msg);
-            bfdebug_subnhex(0, "len", len, msg);
+            bferror_info(0, "writeMemory: arguments", msg);
+            bferror_subnhex(0, "srcGva", srcGva, msg);
+            bferror_subnhex(0, "dstGva", dstGva, msg);
+            bferror_subndec(0, "len", len, msg);
         });
 
         // Check whether there is a split for the relevant 4k page.
@@ -919,23 +922,10 @@ private:
             } else {
                 bfdebug_nhex(DEBUG_LVL, "writeMemory: writing to 2 pages", dstGpa4k);
 
-                bfdebug_transaction(DEBUG_LVL, [&](std::string* msg) {
-                    bfdebug_info(0, "writeMemory: debug", msg);
-                    bfdebug_subnhex(0, "dstGva4k", dstGva4k, msg);
-                    bfdebug_subnhex(0, "dstGvaEnd4k", dstGvaEnd4k, msg);
-                    bfdebug_subnhex(0, "dstGpa4k", dstGpa4k, msg);
-                    // bfdebug_subnhex(0, "dstGpaEnd4k", dstGpaEnd4k, msg);
-                    bfdebug_subnhex(0, "dstGvaEnd", dstGvaEnd, msg);
-                    bfdebug_subndec(0, "len", len, msg);
-                });
-
                 // Check if we already have a split context for the second page.
                 // If not, create one.
                 //
                 const auto dstGpaEnd4k = bfvmm::x64::virt_to_phys_with_cr3(dstGvaEnd4k, cr3);
-
-                bfdebug_subnhex(0, "dstGpaEnd4k", dstGpaEnd4k);
-
                 if (auto* ctx2 = g_splits.getContext(dstGpaEnd4k); ctx2 == nullptr) {
                     if (createSplitContext(dstGvaEnd4k, cr3) != 1ull) {
                         bferror_nhex(ERROR_LVL, "writeMemory: failed to create split context", dstGpaEnd4k);
