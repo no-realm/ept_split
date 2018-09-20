@@ -4,22 +4,20 @@
 #include <bfvmm/Vcpu/vcpu_factory.h>
 #include <bfvmm/memory_manager/arch/x64/unique_map.h>
 
-#include <eapis/hve/arch/intel_x64/Vcpu.h>
+#include <eapis/hve/arch/intel_x64/vcpu.h>
 using namespace eapis::intel_x64;
 
-#include "fplus/fplus.hpp"
-
-#include <cstddef>
-#include <vector>
 #include <array>
 #include <mutex>
+#include <vector>
 
 // Macros for defining print levels.
 //
-#define VIOLATION_EXIT_LVL  1
+#define VIOLATION_EXIT_LVL  0
 #define SPLIT_CONTEXT_LVL   1
 #define MONITOR_TRAP_LVL    1
-#define THRASHING_LVL       1
+#define THRASHING_LVL       0
+#define WRITE_LVL           1
 #define DEBUG_LVL           0
 #define ALERT_LVL           0
 #define ERROR_LVL           0
@@ -402,8 +400,9 @@ public:
 
                 // Enable monitor trap flag for single stepping.
                 //
-                m_trapCtx = ctx;
-                writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
+                // m_trapCtx = ctx;
+                // writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
+                eapis()->set_eptp(g_trapMap);
                 eapis()->enable_monitor_trap_flag();
             }
             else
@@ -412,6 +411,13 @@ public:
                 //
                 std::lock_guard lock{g_eptMutex};
                 flipPage(ctx, PageT::clean);
+
+                if (::intel_x64::ept::pt::entry::execute_access::is_enabled(ctx->pte))
+                    bferror_nhex(0, "read: exec not disabled", gpa4k);
+                if (::intel_x64::ept::pt::entry::read_access::is_disabled(ctx->pte))
+                    bferror_nhex(0, "read: read not enabled", gpa4k);
+                if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte))
+                    bferror_nhex(0, "read: write not enabled", gpa4k);
             }
         } else {
             bfalert_nhex(ALERT_LVL, "read: no split context found", gpa4k);
@@ -485,8 +491,9 @@ public:
 
                     // Enable monitor trap flag for single stepping.
                     //
-                    m_trapCtx = ctx;
-                    writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
+                    // m_trapCtx = ctx;
+                    // writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
+                    eapis()->set_eptp(g_trapMap);
                     eapis()->enable_monitor_trap_flag();
                 }
                 else
@@ -495,6 +502,13 @@ public:
                     //
                     std::lock_guard lock{g_eptMutex};
                     flipPage(ctx, PageT::clean);
+
+                    if (::intel_x64::ept::pt::entry::execute_access::is_enabled(ctx->pte))
+                        bferror_nhex(0, "write: exec not disabled", gpa4k);
+                    if (::intel_x64::ept::pt::entry::read_access::is_disabled(ctx->pte))
+                        bferror_nhex(0, "write: read not enabled", gpa4k);
+                    if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte))
+                        bferror_nhex(0, "write: write not enabled", gpa4k);
                 }
             }
             else
@@ -579,15 +593,23 @@ public:
                     // Enable monitor trap flag for single stepping.
                     //
                     m_trapCtx = ctx;
-                    writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
-                    eapis()->enable_monitor_trap_flag();
+                    eapis()->set_eptp(g_trapMap);
+                    // writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
+                    // eapis()->enable_monitor_trap_flag();
                 }
                 else
                 {
-                    // Flip to clean page.
+                    // Flip to shadow page.
                     //
                     std::lock_guard lock{g_eptMutex};
                     flipPage(ctx, PageT::shadow);
+
+                    if (::intel_x64::ept::pt::entry::execute_access::is_disabled(ctx->pte))
+                        bferror_nhex(0, "exec: exec not enabled", gpa4k);
+                    if (::intel_x64::ept::pt::entry::read_access::is_enabled(ctx->pte))
+                        bferror_nhex(0, "exec: read not disabled", gpa4k);
+                    if (::intel_x64::ept::pt::entry::write_access::is_enabled(ctx->pte))
+                        bferror_nhex(0, "exec: write not disabled", gpa4k);
                 }
             }
             else
@@ -652,7 +674,8 @@ public:
 
         // Flip back to shadow page.
         //
-        flipPage(m_trapCtx, PageT::shadow);
+        // flipPage(m_trapCtx, PageT::shadow);
+        eapis()->set_eptp(g_mainMap);
         ::intel_x64::vmx::invept_global();
 
         return true;
@@ -701,8 +724,8 @@ private:
             // We don't seem to have a split for the requested gva,
             // check whether we have to remap the relevant 2m page range.
             //
-            const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pd::from);
-            if (g_mainMap.is_2m(gpa2m)) {
+            if (!g_mainMap.is_4k(gpa4k)) {
+                const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pd::from);
                 bfdebug_nhex(DEBUG_LVL, "create: remapping 2m page range to 4k", gpa2m);
                 // We need to remap the relevant 2m page range
                 // to 4k granularity.
@@ -718,11 +741,6 @@ private:
             //
             if (auto* ctx = g_splits.getFreeContext(); ctx != nullptr) {
                 bfdebug_nhex(DEBUG_LVL, "create: creating split context", gpa4k);
-
-                ctx->cleanPhys = gpa4k;
-                ctx->cleanVirt = gva4k;
-                ctx->cr3 = cr3;
-                ctx->pte = g_mainMap.entry(gpa4k);
 
                 // Allocate memory for the shadow page.
                 //
@@ -746,6 +764,13 @@ private:
                     reinterpret_cast<void*>(vmmData.get()),
                     ::intel_x64::ept::pt::page_size
                 );
+
+                // Insert other needed data.
+                //
+                ctx->cr3 = cr3;
+                ctx->pte = g_mainMap.entry(gpa4k);
+                ctx->cleanVirt = gva4k;
+                ctx->cleanPhys = gpa4k;
 
                 // Reset reference counter, flip to shadow page
                 // and flush TLB.
@@ -861,6 +886,9 @@ private:
     uint64_t deactivateAllSplits() {
         bfdebug_info(DEBUG_LVL, "deactivate: deactivating all split contexts");
 
+        // Loop over all split contexts, until none
+        // is enabled anymore.
+        //
         SplitPool::SplitContext* temp = g_splits.getFirstEnabledContext();
         while (temp != nullptr) {
             deactivateSplitImpl(temp);
@@ -886,7 +914,7 @@ private:
         const auto dstGva4k = bfn::upper(dstGva, ::intel_x64::ept::pt::from);
         const auto dstGpa4k = bfvmm::x64::virt_to_phys_with_cr3(dstGva4k, cr3);
 
-        bfdebug_transaction(DEBUG_LVL, [&](std::string* msg) {
+        bfdebug_transaction(WRITE_LVL, [&](std::string* msg) {
             bferror_info(0, "writeMemory: arguments", msg);
             bferror_subnhex(0, "srcGva", srcGva, msg);
             bferror_subnhex(0, "dstGva", dstGva, msg);
@@ -919,6 +947,20 @@ private:
                     reinterpret_cast<void*>(vmmData.get()),
                     len
                 );
+
+                #if DEBUG_LEVEL > WRITE_LVL
+                const auto start = reinterpret_cast<uint8_t*>(ctx->shadowVirt + writeOffset);
+                const std::vector<uint8_t> bytes{start, start + len};
+
+                bfdebug_transaction(WRITE_LVL, [&](std::string* msg) {
+                    bfdebug_info(0, "writeMemory: shadow page", msg);
+                    for (auto i = 0; i < bytes.size(); ++i) {
+                        bfdebug_subnhex(0, std::to_string(i).c_str(), bytes[i], msg);
+                    }
+                });
+                #endif
+
+
             } else {
                 bfdebug_nhex(DEBUG_LVL, "writeMemory: writing to 2 pages", dstGpa4k);
 
@@ -926,53 +968,56 @@ private:
                 // If not, create one.
                 //
                 const auto dstGpaEnd4k = bfvmm::x64::virt_to_phys_with_cr3(dstGvaEnd4k, cr3);
-                if (auto* ctx2 = g_splits.getContext(dstGpaEnd4k); ctx2 == nullptr) {
-                    if (createSplitContext(dstGvaEnd4k, cr3) != 1ull) {
-                        bferror_nhex(ERROR_LVL, "writeMemory: failed to create split context", dstGpaEnd4k);
+                auto* ctx2 = g_splits.getContext(dstGpaEnd4k);
+                if (ctx2 == nullptr) {
+                    createSplitContext(dstGvaEnd4k, cr3);
+                    if (ctx2 = g_splits.getContext(dstGpaEnd4k); ctx2 == nullptr) {
+                        bferror_nhex(ERROR_LVL, "writeMemory: split for second page failed", dstGpaEnd4k);
                         return 0ull;
                     }
-                } else {
-                    // Calculate the offset from the start of the page.
-                    //
-                    const auto writeOffset = dstGva - dstGva4k;
-
-                    // Calculate lengths for first and second page.
-                    //
-                    const auto firstLen = dstGvaEnd4k - dstGva - 1;
-                    const auto secondLen = dstGvaEnd - dstGvaEnd4k;
-
-                    // Check if the sum adds up.
-                    //
-                    if (firstLen + secondLen != len) {
-                        bfdebug_transaction(ERROR_LVL, [&](std::string* msg) {
-                            bferror_info(0, "writeMemory: size does not add up", msg);
-                            bferror_subndec(0, "firstLen", firstLen, msg);
-                            bferror_subndec(0, "secondLen", secondLen, msg);
-                            bferror_subndec(0, "len", len, msg);
-                        });
-                        return 0ull;
-                    }
-
-                    // Map the guest memory for the source GVA into host memory.
-                    //
-                    const auto vmmData = bfvmm::x64::make_unique_map<uint8_t>(srcGva, cr3, len);
-
-                    // Write to first page.
-                    //
-                    std::memmove(
-                        reinterpret_cast<void*>(ctx->shadowVirt + writeOffset),
-                        reinterpret_cast<void*>(vmmData.get()),
-                        firstLen
-                    );
-
-                    // Write to second page.
-                    //
-                    std::memmove(
-                        reinterpret_cast<void*>(ctx2->shadowVirt),
-                        reinterpret_cast<void*>(vmmData.get() + firstLen + 1),
-                        secondLen
-                    );
                 }
+
+                // Calculate the offset from the start of the page.
+                //
+                const auto writeOffset = dstGva - dstGva4k;
+
+                // Calculate lengths for first and second page.
+                //
+                const auto firstLen = /*dstGvaEnd4k*/
+                    dstGva4k + ::intel_x64::ept::pt::page_size - dstGva - 1;
+                const auto secondLen = dstGvaEnd - dstGvaEnd4k;
+
+                // Check if the sum adds up.
+                //
+                if (firstLen + secondLen != len) {
+                    bfdebug_transaction(ERROR_LVL, [&](std::string* msg) {
+                        bferror_info(0, "writeMemory: size does not add up", msg);
+                        bferror_subndec(0, "firstLen", firstLen, msg);
+                        bferror_subndec(0, "secondLen", secondLen, msg);
+                        bferror_subndec(0, "len", len, msg);
+                    });
+                    return 0ull;
+                }
+
+                // Map the guest memory for the source GVA into host memory.
+                //
+                const auto vmmData = bfvmm::x64::make_unique_map<uint8_t>(srcGva, cr3, len);
+
+                // Write to first page.
+                //
+                std::memmove(
+                    reinterpret_cast<void*>(ctx->shadowVirt + writeOffset),
+                    reinterpret_cast<void*>(vmmData.get()),
+                    firstLen
+                );
+
+                // Write to second page.
+                //
+                std::memmove(
+                    reinterpret_cast<void*>(ctx2->shadowVirt),
+                    reinterpret_cast<void*>(vmmData.get() + firstLen + 1),
+                    secondLen
+                );
             }
         } else {
             bfalert_nhex(ALERT_LVL, "writeMemory: no split context found", dstGpa4k);
