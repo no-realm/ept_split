@@ -15,7 +15,7 @@ using namespace eapis::intel_x64;
 #define VIOLATION_EXIT_LVL  1
 #define SPLIT_CONTEXT_LVL   1
 #define MONITOR_TRAP_LVL    1
-#define THRASHING_LVL       1
+#define THRASHING_LVL       0
 #define ACCESS_BITS_LVL     1
 #define WRITE_LVL           1
 
@@ -787,7 +787,7 @@ private:
                 ept::identity_map_convert_2m_to_4k(g_mainMap, gpa2m);
                 ::intel_x64::vmx::invept_global();  // necessary?
             } else {
-                bfdebug_nhex(0, "create: already remapped", gpa4k);
+                bfdebug_nhex(DEBUG_LVL, "create: already remapped", gpa4k);
             }
 
             // Create new context.
