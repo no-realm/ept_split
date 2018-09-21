@@ -433,23 +433,23 @@ public:
     bool ept_read_violation_handler(gsl::not_null<vmcs_t *> vmcs, ept_violation_handler::info_t &info) {
         // Update thrashing info.
         //
-        if (const auto rip = vmcs->save_state()->rip; rip == m_prevRip) { m_ripCounter++; }
-        else { m_prevRip = rip; m_ripCounter = 1; }
-
-        // Check for thrashing.
-        //
-        if (m_ripCounter > 4)
-        {
-            bfalert_nhex(THRASHING_LVL, "read: thrashing detected", m_prevRip);
-            m_ripCounter = 1;
-
-            // Enable monitor trap flag for single stepping.
+        if (const auto rip = vmcs->save_state()->rip; rip == m_prevRip) {
+            // Check for thrashing.
             //
-            eapis()->set_eptp(g_trapMap);
-            eapis()->enable_monitor_trap_flag();
+            if (m_ripCounter > 3)
+            {
+                bfalert_nhex(THRASHING_LVL, "read: thrashing detected", m_prevRip);
+                m_ripCounter = 1;
 
-            return true;
+                // Enable monitor trap flag for single stepping.
+                //
+                eapis()->set_eptp(g_trapMap);
+                eapis()->enable_monitor_trap_flag();
+
+                return true;
+            }
         }
+        else { m_prevRip = rip; m_ripCounter = 1; }
 
         const auto gpa4k = bfn::upper(info.gpa, ::intel_x64::ept::pt::from);
 
@@ -595,23 +595,23 @@ public:
     bool ept_execute_violation_handler(gsl::not_null<vmcs_t *> vmcs, ept_violation_handler::info_t &info) {
         // Update thrashing info.
         //
-        if (const auto rip = vmcs->save_state()->rip; rip == m_prevRip) { m_ripCounter++; }
-        else { m_prevRip = rip; m_ripCounter = 1; }
-
-        // Check for thrashing.
-        //
-        if (m_ripCounter > 4)
-        {
-            bfalert_nhex(THRASHING_LVL, "exec: thrashing detected", m_prevRip);
-            m_ripCounter = 1;
-
-            // Enable monitor trap flag for single stepping.
+        if (const auto rip = vmcs->save_state()->rip; rip == m_prevRip) {
+            // Check for thrashing.
             //
-            eapis()->set_eptp(g_trapMap);
-            eapis()->enable_monitor_trap_flag();
+            if (m_ripCounter > 3)
+            {
+                bfalert_nhex(THRASHING_LVL, "exec: thrashing detected", m_prevRip);
+                m_ripCounter = 1;
 
-            return true;
+                // Enable monitor trap flag for single stepping.
+                //
+                eapis()->set_eptp(g_trapMap);
+                eapis()->enable_monitor_trap_flag();
+
+                return true;
+            }
         }
+        else { m_prevRip = rip; m_ripCounter = 1; }
 
         const auto gpa4k = bfn::upper(info.gpa, ::intel_x64::ept::pt::from);
 
