@@ -13,14 +13,14 @@ using namespace eapis::intel_x64;
 
 // Macros for defining print levels.
 //
-#define VIOLATION_EXIT_LVL  1
+#define VIOLATION_EXIT_LVL  0
 #define SPLIT_CONTEXT_LVL   1
-#define MONITOR_TRAP_LVL    1
+#define MONITOR_TRAP_LVL    0
 #define THRASHING_LVL       1
 #define ACCESS_BITS_LVL     1
 #define WRITE_LVL           1
 
-#define DEBUG_LVL           1
+#define DEBUG_LVL           0
 #define ALERT_LVL           0
 #define ERROR_LVL           0
 
@@ -471,11 +471,11 @@ public:
             flipPage(ctx, PageT::clean);
 
             #if DEBUG_LEVEL > ACCESS_BITS_LVL
-            if (::intel_x64::ept::pt::entry::execute_access::is_enabled(ctx->pte))
+            if (::intel_x64::ept::pt::entry::execute_access::is_enabled(ctx->pte.get()))
                 bferror_nhex(ERROR_LVL, "read: exec not disabled", gpa4k);
-            if (::intel_x64::ept::pt::entry::read_access::is_disabled(ctx->pte))
+            if (::intel_x64::ept::pt::entry::read_access::is_disabled(ctx->pte.get()))
                 bferror_nhex(ERROR_LVL, "read: read not enabled", gpa4k);
-            if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte))
+            if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte.get()))
                 bferror_nhex(ERROR_LVL, "read: write not enabled", gpa4k);
             #endif
         } else {
@@ -515,26 +515,7 @@ public:
     }
 
     bool ept_write_violation_handler(gsl::not_null<vmcs_t *> vmcs, ept_violation_handler::info_t &info) {
-        // Update thrashing info.
-        //
-        if (const auto rip = vmcs->save_state()->rip; rip == m_prevRip) { m_ripCounter++; }
-        else { m_prevRip = rip; m_ripCounter = 1; }
-
-        // Check for thrashing.
-        //
-        if (m_ripCounter > 4)
-        {
-            bfalert_nhex(THRASHING_LVL, "write: thrashing detected", m_prevRip);
-            m_ripCounter = 1;
-
-            // Enable monitor trap flag for single stepping.
-            //
-            eapis()->set_eptp(g_trapMap);
-            eapis()->enable_monitor_trap_flag();
-
-            return true;
-        }
-
+        m_prevRip = 0; m_ripCounter = 0;
         const auto gpa4k = bfn::upper(info.gpa, ::intel_x64::ept::pt::from);
 
         bfdebug_transaction(VIOLATION_EXIT_LVL, [&](std::string* msg) {
@@ -717,7 +698,7 @@ public:
     {
         bfignored(info);
 
-        bfalert_nhex(THRASHING_LVL, "trap: rip", vmcs->save_state()->rip);
+        bfalert_nhex(MONITOR_TRAP_LVL, "trap: rip", vmcs->save_state()->rip);
         // Revert back to the main memory map.
         //
         eapis()->set_eptp(g_mainMap);
