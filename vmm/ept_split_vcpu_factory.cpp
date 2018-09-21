@@ -7,15 +7,16 @@
 #include <eapis/hve/arch/intel_x64/vcpu.h>
 using namespace eapis::intel_x64;
 
-#include <mutex>
 #include <vector>
+#include <mutex>
+#include <shared_mutex>
 
 // Macros for defining print levels.
 //
 #define VIOLATION_EXIT_LVL  1
 #define SPLIT_CONTEXT_LVL   1
 #define MONITOR_TRAP_LVL    1
-#define THRASHING_LVL       0
+#define THRASHING_LVL       1
 #define ACCESS_BITS_LVL     1
 #define WRITE_LVL           1
 
@@ -46,7 +47,7 @@ ept::mmap::entry_type g_dummyPte{};
 //
 std::mutex g_eptMutex;
 
-#define INITIAL_SPLIT_SIZE 50ull
+#define INITIAL_SPLIT_SIZE 32ull
 
 class SplitPool {
 public:
@@ -75,7 +76,7 @@ public:
     // else returns nullptr.
     //
     SplitContext const* findContext(const uintptr_t gpa4k) noexcept {
-        std::lock_guard lock{m_ctxMutex};
+        std::shared_lock lock{m_ctxMutex};
 
         for (const auto& ctx : m_splitContexts) {
             if (ctx->cleanPhys == gpa4k)
@@ -91,7 +92,7 @@ public:
     // Returns a const pointer of the created context.
     //
     SplitContext const* createContext(const uintptr_t gva4k, const uintptr_t gpa4k, const uint64_t cr3) {
-        std::lock_guard lock{m_ctxMutex};
+        std::unique_lock lock{m_ctxMutex};
 
         // Allocate new context.
         //
@@ -137,6 +138,8 @@ public:
     // didn't find a matching context, false.
     //
     bool deleteContext(const uintptr_t gpa4k) {
+        std::unique_lock lock{m_ctxMutex};
+
         auto it = std::find_if(m_splitContexts.cbegin(), m_splitContexts.cend(),
         [gpa4k](const auto& ctx) {
             return ctx->cleanPhys == gpa4k;
@@ -156,11 +159,10 @@ public:
     // else returns nullptr.
     //
     SplitContext const* getContext() noexcept {
-        std::lock_guard lock{m_ctxMutex};
-
         if (m_splitContexts.empty())
             return nullptr;
 
+        // std::shared_lock lock{m_ctxMutex};
         return m_splitContexts.back().get();
     }
 
@@ -169,7 +171,7 @@ public:
     // Returns true if yes, else false.
     //
     bool existsInRange(const uintptr_t start, const uintptr_t end) noexcept {
-        std::lock_guard lock{m_ctxMutex};
+        std::shared_lock lock{m_ctxMutex};
 
         for (const auto& ctx : m_splitContexts) {
             if (ctx->cleanPhys >= start && ctx->cleanPhys < end)
@@ -186,18 +188,19 @@ public:
     // Member functions for increasing/decreasing the reference counter of split contexts.
     //
     size_t incCounter(SplitContext const* ctx) noexcept {
-        std::lock_guard lock{m_ctxMutex};
+        std::lock_guard lock{m_refCounterMutex};
         return ++const_cast<SplitContext*>(ctx)->refCount;
     }
 
     size_t decCounter(SplitContext const* ctx) noexcept {
-        std::lock_guard lock{m_ctxMutex};
+        std::lock_guard lock{m_refCounterMutex};
         return --const_cast<SplitContext*>(ctx)->refCount;;
     }
 
 private:
     std::vector<std::unique_ptr<SplitContext>> m_splitContexts;
-    std::mutex m_ctxMutex;
+    std::shared_mutex m_ctxMutex;
+    std::mutex m_refCounterMutex;
 };
 
 // This pool will hold all split contexts.
@@ -428,9 +431,26 @@ public:
     // -----------------------------------------------------------------------------
 
     bool ept_read_violation_handler(gsl::not_null<vmcs_t *> vmcs, ept_violation_handler::info_t &info) {
-        // const auto gva = vmcs_n::guest_linear_address::get();
-        // const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
-        // const auto cr3 = vmcs_n::guest_cr3::get();
+        // Update thrashing info.
+        //
+        if (const auto rip = vmcs->save_state()->rip; rip == m_prevRip) { m_ripCounter++; }
+        else { m_prevRip = rip; m_ripCounter = 1; }
+
+        // Check for thrashing.
+        //
+        if (m_ripCounter > 4)
+        {
+            bfalert_nhex(THRASHING_LVL, "read: thrashing detected", m_prevRip);
+            m_ripCounter = 1;
+
+            // Enable monitor trap flag for single stepping.
+            //
+            eapis()->set_eptp(g_trapMap);
+            eapis()->enable_monitor_trap_flag();
+
+            return true;
+        }
+
         const auto gpa4k = bfn::upper(info.gpa, ::intel_x64::ept::pt::from);
 
         bfdebug_transaction(VIOLATION_EXIT_LVL, [&](std::string* msg) {
@@ -445,48 +465,26 @@ public:
         //
         if (const auto* ctx = g_splits.findContext(gpa4k); ctx != nullptr)
         {
-            // Check for thrashing.
+            // Flip to clean page.
             //
-            if (vmcs->save_state()->rip == m_prevRip && ctx->cr3 == vmcs_n::guest_cr3::get()) { m_ripCounter++; }
-            else { m_prevRip = vmcs->save_state()->rip; m_ripCounter = 1; }
+            std::lock_guard lock{g_eptMutex};
+            flipPage(ctx, PageT::clean);
 
-            if (m_ripCounter > 4)
-            {
-                bfalert_nhex(THRASHING_LVL, "read: thrashing detected", m_prevRip);
-                m_ripCounter = 1;
-
-                // Enable monitor trap flag for single stepping.
-                //
-                eapis()->set_eptp(g_trapMap);
-                eapis()->enable_monitor_trap_flag();
-            }
-            else
-            {
-                // Flip to clean page.
-                //
-                std::lock_guard lock{g_eptMutex};
-                flipPage(ctx, PageT::clean);
-
-                #if DEBUG_LEVEL > ACCESS_BITS_LVL
-                if (::intel_x64::ept::pt::entry::execute_access::is_enabled(ctx->pte))
-                    bferror_nhex(ERROR_LVL, "read: exec not disabled", gpa4k);
-                if (::intel_x64::ept::pt::entry::read_access::is_disabled(ctx->pte))
-                    bferror_nhex(ERROR_LVL, "read: read not enabled", gpa4k);
-                if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte))
-                    bferror_nhex(ERROR_LVL, "read: write not enabled", gpa4k);
-                #endif
-            }
+            #if DEBUG_LEVEL > ACCESS_BITS_LVL
+            if (::intel_x64::ept::pt::entry::execute_access::is_enabled(ctx->pte))
+                bferror_nhex(ERROR_LVL, "read: exec not disabled", gpa4k);
+            if (::intel_x64::ept::pt::entry::read_access::is_disabled(ctx->pte))
+                bferror_nhex(ERROR_LVL, "read: read not enabled", gpa4k);
+            if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte))
+                bferror_nhex(ERROR_LVL, "read: write not enabled", gpa4k);
+            #endif
         } else {
-            bfalert_nhex(ALERT_LVL, "read: no split context found", gpa4k);
-
-            // Get page table entry.
-            //
-            std::reference_wrapper<ept::mmap::entry_type> entry = g_mainMap.entry(gpa4k);
 
             // Check page granularity.
             //
             if (g_mainMap.is_4k(gpa4k)) {
                 using namespace ::intel_x64::ept::pt::entry;
+                auto& entry = g_mainMap.entry(gpa4k);
 
                 // Check for outdated access bits.
                 //
@@ -494,10 +492,11 @@ public:
                 {
                     bfalert_nhex(ALERT_LVL, "read: resetting access bits for 4k entry", gpa4k);
                     std::lock_guard lock{g_eptMutex};
-                    writePte(entry.get(), phys_addr::get(entry), AccessBitsT::all);
+                    writePte(entry, phys_addr::get(entry), AccessBitsT::all);
                 }
             } else {
                 using namespace ::intel_x64::ept::pd::entry;
+                auto& entry = g_mainMap.entry(gpa4k);
 
                 // Check for outdated access bits.
                 //
@@ -506,7 +505,7 @@ public:
                     const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pt::from);
                     bfalert_nhex(ALERT_LVL, "read: resetting access bits for 2m entry", gpa2m);
                     std::lock_guard lock{g_eptMutex};
-                    writePte(entry.get(), phys_addr::get(entry), AccessBitsT::all);
+                    writePte(entry, phys_addr::get(entry), AccessBitsT::all);
                 }
             }
         }
@@ -516,9 +515,26 @@ public:
     }
 
     bool ept_write_violation_handler(gsl::not_null<vmcs_t *> vmcs, ept_violation_handler::info_t &info) {
-        // const auto gva = vmcs_n::guest_linear_address::get();
-        // const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
-        // const auto cr3 = vmcs_n::guest_cr3::get();
+        // Update thrashing info.
+        //
+        if (const auto rip = vmcs->save_state()->rip; rip == m_prevRip) { m_ripCounter++; }
+        else { m_prevRip = rip; m_ripCounter = 1; }
+
+        // Check for thrashing.
+        //
+        if (m_ripCounter > 4)
+        {
+            bfalert_nhex(THRASHING_LVL, "write: thrashing detected", m_prevRip);
+            m_ripCounter = 1;
+
+            // Enable monitor trap flag for single stepping.
+            //
+            eapis()->set_eptp(g_trapMap);
+            eapis()->enable_monitor_trap_flag();
+
+            return true;
+        }
+
         const auto gpa4k = bfn::upper(info.gpa, ::intel_x64::ept::pt::from);
 
         bfdebug_transaction(VIOLATION_EXIT_LVL, [&](std::string* msg) {
@@ -536,37 +552,19 @@ public:
             // Check if the write violation occurred in the same CR3 context.
             //
             if (ctx->cr3 == vmcs_n::guest_cr3::get()) {
-                // Check for thrashing.
+                // Flip to clean page.
                 //
-                if (vmcs->save_state()->rip == m_prevRip) { m_ripCounter++; }
-                else { m_prevRip = vmcs->save_state()->rip; m_ripCounter = 1; }
+                std::lock_guard lock{g_eptMutex};
+                flipPage(ctx, PageT::clean);
 
-                if (m_ripCounter > 4)
-                {
-                    bfalert_nhex(THRASHING_LVL, "write: thrashing detected", m_prevRip);
-                    m_ripCounter = 1;
-
-                    // Enable monitor trap flag for single stepping.
-                    //
-                    eapis()->set_eptp(g_trapMap);
-                    eapis()->enable_monitor_trap_flag();
-                }
-                else
-                {
-                    // Flip to clean page.
-                    //
-                    std::lock_guard lock{g_eptMutex};
-                    flipPage(ctx, PageT::clean);
-
-                    #if DEBUG_LEVEL > ACCESS_BITS_LVL
-                    if (::intel_x64::ept::pt::entry::execute_access::is_enabled(ctx->pte))
-                        bferror_nhex(ERROR_LVL, "write: exec not disabled", gpa4k);
-                    if (::intel_x64::ept::pt::entry::read_access::is_disabled(ctx->pte))
-                        bferror_nhex(ERROR_LVL, "write: read not enabled", gpa4k);
-                    if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte))
-                        bferror_nhex(ERROR_LVL, "write: write not enabled", gpa4k);
-                    #endif
-                }
+                #if DEBUG_LEVEL > ACCESS_BITS_LVL
+                if (::intel_x64::ept::pt::entry::execute_access::is_enabled(ctx->pte.get()))
+                    bferror_nhex(ERROR_LVL, "write: exec not disabled", gpa4k);
+                if (::intel_x64::ept::pt::entry::read_access::is_disabled(ctx->pte.get()))
+                    bferror_nhex(ERROR_LVL, "write: read not enabled", gpa4k);
+                if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte.get()))
+                    bferror_nhex(ERROR_LVL, "write: write not enabled", gpa4k);
+                #endif
             }
             else
             {
@@ -575,19 +573,15 @@ public:
                 // Deactivate the split context, since it seems like the
                 // application changed.
                 //
-                deactivateSplitImpl(ctx);
+                if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte.get()))
+                    deactivateSplitImpl(ctx);
             }
         } else {
-            bfalert_nhex(ALERT_LVL, "write: no split context found", gpa4k);
-
-            // Get page table entry.
-            //
-            std::reference_wrapper<ept::mmap::entry_type> entry = g_mainMap.entry(gpa4k);
-
             // Check page granularity.
             //
             if (g_mainMap.is_4k(gpa4k)) {
                 using namespace ::intel_x64::ept::pt::entry;
+                auto& entry = g_mainMap.entry(gpa4k);
 
                 // Check for outdated access bits.
                 //
@@ -595,10 +589,11 @@ public:
                 {
                     bfalert_nhex(ALERT_LVL, "write: resetting access bits for 4k entry", gpa4k);
                     std::lock_guard lock{g_eptMutex};
-                    writePte(entry.get(), phys_addr::get(entry), AccessBitsT::all);
+                    writePte(entry, phys_addr::get(entry), AccessBitsT::all);
                 }
             } else {
                 using namespace ::intel_x64::ept::pd::entry;
+                auto& entry = g_mainMap.entry(gpa4k);
 
                 // Check for outdated access bits.
                 //
@@ -607,7 +602,7 @@ public:
                     const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pt::from);
                     bfalert_nhex(ALERT_LVL, "write: resetting access bits for 2m entry", gpa2m);
                     std::lock_guard lock{g_eptMutex};
-                    writePte(entry.get(), phys_addr::get(entry), AccessBitsT::all);
+                    writePte(entry, phys_addr::get(entry), AccessBitsT::all);
                 }
             }
         }
@@ -617,9 +612,26 @@ public:
     }
 
     bool ept_execute_violation_handler(gsl::not_null<vmcs_t *> vmcs, ept_violation_handler::info_t &info) {
-        // const auto gva = vmcs_n::guest_linear_address::get();
-        // const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
-        // const auto cr3 = vmcs_n::guest_cr3::get();
+        // Update thrashing info.
+        //
+        if (const auto rip = vmcs->save_state()->rip; rip == m_prevRip) { m_ripCounter++; }
+        else { m_prevRip = rip; m_ripCounter = 1; }
+
+        // Check for thrashing.
+        //
+        if (m_ripCounter > 4)
+        {
+            bfalert_nhex(THRASHING_LVL, "exec: thrashing detected", m_prevRip);
+            m_ripCounter = 1;
+
+            // Enable monitor trap flag for single stepping.
+            //
+            eapis()->set_eptp(g_trapMap);
+            eapis()->enable_monitor_trap_flag();
+
+            return true;
+        }
+
         const auto gpa4k = bfn::upper(info.gpa, ::intel_x64::ept::pt::from);
 
         bfdebug_transaction(VIOLATION_EXIT_LVL, [&](std::string* msg) {
@@ -637,37 +649,19 @@ public:
             // Check if the exec violation occurred in the same CR3 context.
             //
             if (ctx->cr3 == vmcs_n::guest_cr3::get()) {
-                // Check for thrashing.
+                // Flip to shadow page.
                 //
-                if (vmcs->save_state()->rip == m_prevRip) { m_ripCounter++; }
-                else { m_prevRip = vmcs->save_state()->rip; m_ripCounter = 1; }
+                std::lock_guard lock{g_eptMutex};
+                flipPage(ctx, PageT::shadow);
 
-                if (m_ripCounter > 4)
-                {
-                    bfalert_nhex(THRASHING_LVL, "exec: thrashing detected", m_prevRip);
-                    m_ripCounter = 1;
-
-                    // Enable monitor trap flag for single stepping.
-                    //
-                    eapis()->set_eptp(g_trapMap);
-                    eapis()->enable_monitor_trap_flag();
-                }
-                else
-                {
-                    // Flip to shadow page.
-                    //
-                    std::lock_guard lock{g_eptMutex};
-                    flipPage(ctx, PageT::shadow);
-
-                    #if DEBUG_LEVEL > ACCESS_BITS_LVL
-                    if (::intel_x64::ept::pt::entry::execute_access::is_disabled(ctx->pte))
-                        bferror_nhex(ERROR_LVL, "exec: exec not enabled", gpa4k);
-                    if (::intel_x64::ept::pt::entry::read_access::is_enabled(ctx->pte))
-                        bferror_nhex(ERROR_LVL, "exec: read not disabled", gpa4k);
-                    if (::intel_x64::ept::pt::entry::write_access::is_enabled(ctx->pte))
-                        bferror_nhex(ERROR_LVL, "exec: write not disabled", gpa4k);
-                    #endif
-                }
+                #if DEBUG_LEVEL > ACCESS_BITS_LVL
+                if (::intel_x64::ept::pt::entry::execute_access::is_disabled(ctx->pte.get()))
+                    bferror_nhex(ERROR_LVL, "exec: exec not enabled", gpa4k);
+                if (::intel_x64::ept::pt::entry::read_access::is_enabled(ctx->pte.get()))
+                    bferror_nhex(ERROR_LVL, "exec: read not disabled", gpa4k);
+                if (::intel_x64::ept::pt::entry::write_access::is_enabled(ctx->pte.get()))
+                    bferror_nhex(ERROR_LVL, "exec: write not disabled", gpa4k);
+                #endif
             }
             else
             {
@@ -676,19 +670,15 @@ public:
                 // Deactivate the split context, since it seems like the
                 // application changed.
                 //
-                deactivateSplitImpl(ctx);
+                if (::intel_x64::ept::pt::entry::execute_access::is_disabled(ctx->pte.get()))
+                    deactivateSplitImpl(ctx);
             }
         } else {
-            bfalert_nhex(ALERT_LVL, "exec: no split context found", gpa4k);
-
-            // Get page table entry.
-            //
-            std::reference_wrapper<ept::mmap::entry_type> entry = g_mainMap.entry(gpa4k);
-
             // Check page granularity.
             //
             if (g_mainMap.is_4k(gpa4k)) {
                 using namespace ::intel_x64::ept::pt::entry;
+                auto& entry = g_mainMap.entry(gpa4k);
 
                 // Check for outdated access bits.
                 //
@@ -696,10 +686,11 @@ public:
                 {
                     bfalert_nhex(ALERT_LVL, "exec: resetting access bits for 4k entry", gpa4k);
                     std::lock_guard lock{g_eptMutex};
-                    writePte(entry.get(), phys_addr::get(entry), AccessBitsT::all);
+                    writePte(entry, phys_addr::get(entry), AccessBitsT::all);
                 }
             } else {
                 using namespace ::intel_x64::ept::pd::entry;
+                auto& entry = g_mainMap.entry(gpa4k);
 
                 // Check for outdated access bits.
                 //
@@ -708,7 +699,7 @@ public:
                     const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pt::from);
                     bfalert_nhex(ALERT_LVL, "exec: resetting access bits for 2m entry", gpa2m);
                     std::lock_guard lock{g_eptMutex};
-                    writePte(entry.get(), phys_addr::get(entry), AccessBitsT::all);
+                    writePte(entry, phys_addr::get(entry), AccessBitsT::all);
                 }
             }
         }
