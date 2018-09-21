@@ -7,20 +7,19 @@
 #include <eapis/hve/arch/intel_x64/vcpu.h>
 using namespace eapis::intel_x64;
 
-#include <array>
 #include <mutex>
 #include <vector>
 
 // Macros for defining print levels.
 //
-#define VIOLATION_EXIT_LVL  0
+#define VIOLATION_EXIT_LVL  1
 #define SPLIT_CONTEXT_LVL   1
 #define MONITOR_TRAP_LVL    1
-#define THRASHING_LVL       0
+#define THRASHING_LVL       1
 #define ACCESS_BITS_LVL     1
 #define WRITE_LVL           1
 
-#define DEBUG_LVL           0
+#define DEBUG_LVL           1
 #define ALERT_LVL           0
 #define ERROR_LVL           0
 
@@ -47,22 +46,17 @@ ept::mmap::entry_type g_dummyPte{};
 //
 std::mutex g_eptMutex;
 
-// Maximum number of splits you can have
-// at one time.
-//
-constexpr unsigned const MAX_SPLITS = 100u;
+#define INITIAL_SPLIT_SIZE 50ull
 
 class SplitPool {
 public:
-    SplitPool() noexcept : m_splitContexts{}, m_refMutex{}
-    { }
-
+    // Context for holding information about a split.
+    //
     struct SplitContext {
-        bool enabled{};
         uintptr_t cleanPhys{};
+        uintptr_t shadowPhys{};
 
         std::reference_wrapper<ept::mmap::entry_type> pte{g_dummyPte};
-        uintptr_t shadowPhys{};
         uintptr_t shadowVirt{};
         uintptr_t cleanVirt{};
 
@@ -71,73 +65,139 @@ public:
         std::unique_ptr<uint8_t[]> shadowPage{nullptr};
     };
 
-    SplitContext* getContext(const uintptr_t gpa4k) noexcept {
-        for (auto it = m_splitContexts.begin();
-            it != m_splitContexts.end(); ++it) {
-            if (it->enabled && (it->cleanPhys == gpa4k)) return it;
-        }
+    SplitPool() noexcept
+        : m_splitContexts{}, m_ctxMutex{}
+    { m_splitContexts.reserve(INITIAL_SPLIT_SIZE); }
 
-        return nullptr;
-    }
-
-    SplitContext* getFreeContext() noexcept {
-        for (auto it = m_splitContexts.begin();
-            it != m_splitContexts.end(); ++it) {
-            if (!it->enabled) {
-                it->cleanPhys = 0ull;
-                it->enabled = true;
-                return it;
-            }
-        }
-
-        return nullptr;
-    }
-
-    SplitContext* getFirstEnabledContext() noexcept {
-        for (auto it = m_splitContexts.begin();
-            it != m_splitContexts.end(); ++it) {
-            if (it->enabled)
-                return it;
-        }
-
-        return nullptr;
-    }
-
-    SplitContext* getContextByIndex(const int index) noexcept {
-        return m_splitContexts.begin() + index;
-    }
-
-    // Counts how many split contexts are currently
-    // enabled/active.
+    // Searches for a split context matching the passed gpa4k.
     //
-    unsigned activeSplits() const noexcept {
-        unsigned counter = 0;
+    // Returns a const pointer of the context if found,
+    // else returns nullptr.
+    //
+    SplitContext const* findContext(const uintptr_t gpa4k) noexcept {
+        std::lock_guard lock{m_ctxMutex};
+
         for (const auto& ctx : m_splitContexts) {
-            if (ctx.enabled) counter++;
+            if (ctx->cleanPhys == gpa4k)
+                return ctx.get();
         }
-        return counter;
+
+        return nullptr;
     }
 
-    // Member functions for modifying the reference counter of split contexts.
+    // Creates a new context without checking whether there is already one for the
+    // given gpa4k.
     //
-    size_t incCounter(SplitContext* ctx) noexcept {
-        std::lock_guard lock{m_refMutex};
-        return ++ctx->refCount;
+    // Returns a const pointer of the created context.
+    //
+    SplitContext const* createContext(const uintptr_t gva4k, const uintptr_t gpa4k, const uint64_t cr3) {
+        std::lock_guard lock{m_ctxMutex};
+
+        // Allocate new context.
+        //
+        auto* ctx = m_splitContexts.emplace_back(std::make_unique<SplitContext>()).get();
+
+        // Allocate memory for the shadow page.
+        //
+        ctx->shadowPage = std::make_unique<uint8_t[]>(::intel_x64::ept::pt::page_size);
+        ctx->shadowVirt = reinterpret_cast<uintptr_t>(ctx->shadowPage.get());
+        ctx->shadowPhys = g_mm->virtint_to_physint(ctx->shadowVirt);
+
+        // Map clean page into VMM (Host) memory.
+        //
+        const auto vmmData =
+        bfvmm::x64::make_unique_map<uint8_t>(
+            gva4k,
+            cr3,
+            ::intel_x64::ept::pt::page_size
+        );
+
+        // Copy contents of clean page (VMM copy) to shadow page.
+        //
+        std::memmove(
+            reinterpret_cast<void*>(ctx->shadowVirt),
+            reinterpret_cast<void*>(vmmData.get()),
+            ::intel_x64::ept::pt::page_size
+        );
+
+        // Insert other needed data.
+        //
+        ctx->cr3 = cr3;
+        ctx->pte = g_mainMap.entry(gpa4k);
+        ctx->cleanVirt = gva4k;
+        ctx->cleanPhys = gpa4k;
+        ctx->refCount = 1;
+
+        return ctx;
     }
 
-    size_t decCounter(SplitContext* ctx) noexcept {
-        std::lock_guard lock{m_refMutex};
-        return --ctx->refCount;
+    // Deletes the split context associated with the passed gpa4k.
+    //
+    // Returns true, if it deleted a context, else, if it
+    // didn't find a matching context, false.
+    //
+    bool deleteContext(const uintptr_t gpa4k) {
+        auto it = std::find_if(m_splitContexts.cbegin(), m_splitContexts.cend(),
+        [gpa4k](const auto& ctx) {
+            return ctx->cleanPhys == gpa4k;
+        });
+
+        if (it == m_splitContexts.cend())
+            return false;
+        else
+            m_splitContexts.erase(it);
+
+        return true;
     }
 
-    size_t resetCounter(SplitContext* ctx) noexcept {
-        std::lock_guard lock{m_refMutex};
-        return ctx->refCount = 1;
+    bool deleteContext(SplitContext const* ctx) { return deleteContext(ctx->cleanPhys); }
+
+    // Returns, if available, the last split context,
+    // else returns nullptr.
+    //
+    SplitContext const* getContext() noexcept {
+        std::lock_guard lock{m_ctxMutex};
+
+        if (m_splitContexts.empty())
+            return nullptr;
+
+        return m_splitContexts.back().get();
+    }
+
+    // Checks whether there is a context that is in the provided range.
+    //
+    // Returns true if yes, else false.
+    //
+    bool existsInRange(const uintptr_t start, const uintptr_t end) noexcept {
+        std::lock_guard lock{m_ctxMutex};
+
+        for (const auto& ctx : m_splitContexts) {
+            if (ctx->cleanPhys >= start && ctx->cleanPhys < end)
+                return true;
+        }
+
+        return false;
+    }
+
+    // Returns number of split contexts.
+    //
+    size_t numSplits() const noexcept { return m_splitContexts.size(); }
+
+    // Member functions for increasing/decreasing the reference counter of split contexts.
+    //
+    size_t incCounter(SplitContext const* ctx) noexcept {
+        std::lock_guard lock{m_ctxMutex};
+        return ++const_cast<SplitContext*>(ctx)->refCount;
+    }
+
+    size_t decCounter(SplitContext const* ctx) noexcept {
+        std::lock_guard lock{m_ctxMutex};
+        return --const_cast<SplitContext*>(ctx)->refCount;;
     }
 
 private:
-    std::array<SplitContext, MAX_SPLITS> m_splitContexts;
-    std::mutex m_refMutex;
+    std::vector<std::unique_ptr<SplitContext>> m_splitContexts;
+    std::mutex m_ctxMutex;
 };
 
 // This pool will hold all split contexts.
@@ -191,7 +251,7 @@ class Vcpu : public eapis::intel_x64::vcpu
     // Sets the physical address and access bits for
     // the provided split context.
     //
-    void flipPage(SplitPool::SplitContext* ctx, const PageT flipTo) noexcept {
+    void flipPage(SplitPool::SplitContext const* ctx, const PageT flipTo) noexcept {
         if (flipTo == PageT::clean)
         { writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::read_write); }
         else
@@ -199,7 +259,7 @@ class Vcpu : public eapis::intel_x64::vcpu
     }
 
     void flipPage(uintptr_t gpa4k, const PageT flipTo) noexcept {
-        flipPage(g_splits.getContext(gpa4k), flipTo);
+        flipPage(g_splits.findContext(gpa4k), flipTo);
     }
 
     // For thrashing detection.
@@ -383,7 +443,7 @@ public:
 
         // Check if there is a split context for the requested page.
         //
-        if (auto* ctx = g_splits.getContext(gpa4k); ctx != nullptr)
+        if (const auto* ctx = g_splits.findContext(gpa4k); ctx != nullptr)
         {
             // Check for thrashing.
             //
@@ -451,7 +511,7 @@ public:
             }
         }
 
-        info.ignore_advance = true;
+        // info.ignore_advance = true;
         return true;
     }
 
@@ -471,7 +531,7 @@ public:
 
         // Check if there is a split context for the requested page.
         //
-        if (auto* ctx = g_splits.getContext(gpa4k); ctx != nullptr)
+        if (auto* ctx = g_splits.findContext(gpa4k); ctx != nullptr)
         {
             // Check if the write violation occurred in the same CR3 context.
             //
@@ -552,7 +612,7 @@ public:
             }
         }
 
-        info.ignore_advance = true;
+        // info.ignore_advance = true;
         return true;
     }
 
@@ -572,7 +632,7 @@ public:
 
         // Check if there is a split context for the requested page.
         //
-        if (auto* ctx = g_splits.getContext(gpa4k); ctx != nullptr)
+        if (auto* ctx = g_splits.findContext(gpa4k); ctx != nullptr)
         {
             // Check if the exec violation occurred in the same CR3 context.
             //
@@ -653,7 +713,7 @@ public:
             }
         }
 
-        info.ignore_advance = true;
+        // info.ignore_advance = true;
         return true;
     }
 
@@ -703,7 +763,7 @@ private:
         //
         const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
         const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
-        if (auto* ctx = g_splits.getContext(gpa4k); ctx != nullptr) {
+        if (const auto* ctx = g_splits.findContext(gpa4k); ctx != nullptr) {
             // Since we already have a split for the requested gva,
             // we will just increase the refCounter.
             //
@@ -730,61 +790,23 @@ private:
                 bfdebug_nhex(0, "create: already remapped", gpa4k);
             }
 
-            // Ask for a free context which we can configure.
+            // Create new context.
             //
-            if (auto* ctx = g_splits.getFreeContext(); ctx != nullptr) {
-                bfdebug_nhex(DEBUG_LVL, "create: creating split context", gpa4k);
+            bfdebug_nhex(DEBUG_LVL, "create: creating split context", gpa4k);
+            ctx = g_splits.createContext(gva4k, gpa4k, cr3);
 
-                // Allocate memory for the shadow page.
-                //
-                ctx->shadowPage = std::make_unique<uint8_t[]>(::intel_x64::ept::pt::page_size);
-                ctx->shadowVirt = reinterpret_cast<uintptr_t>(ctx->shadowPage.get());
-                ctx->shadowPhys = g_mm->virtint_to_physint(ctx->shadowVirt);
+            flipPage(ctx, PageT::shadow);
+            ::intel_x64::vmx::invept_global();
 
-                // Map clean page into VMM (Host) memory.
-                //
-                const auto vmmData =
-                bfvmm::x64::make_unique_map<uint8_t>(
-                    gva4k,
-                    cr3,
-                    ::intel_x64::ept::pt::page_size
-                );
-
-                // Copy contents of clean page (VMM copy) to shadow page.
-                //
-                std::memmove(
-                    reinterpret_cast<void*>(ctx->shadowVirt),
-                    reinterpret_cast<void*>(vmmData.get()),
-                    ::intel_x64::ept::pt::page_size
-                );
-
-                // Insert other needed data.
-                //
-                ctx->cr3 = cr3;
-                ctx->pte = g_mainMap.entry(gpa4k);
-                ctx->cleanVirt = gva4k;
-                ctx->cleanPhys = gpa4k;
-
-                // Reset reference counter, flip to shadow page
-                // and flush TLB.
-                //
-                g_splits.resetCounter(ctx);
-                flipPage(ctx, PageT::shadow);
-                ::intel_x64::vmx::invept_global();
-
-                bfdebug_transaction(SPLIT_CONTEXT_LVL, [&](std::string* msg) {
-                    bfdebug_info(0, "create: new split context", msg);
-                    bfdebug_subnhex(0, "cleanPhys", gpa4k, msg);
-                    bfdebug_subnhex(0, "cleanVirt", gva4k, msg);
-                    bfdebug_subnhex(0, "shadowPhys", ctx->shadowPhys, msg);;
-                    bfdebug_subnhex(0, "shadowVirt", ctx->shadowVirt, msg);
-                    bfdebug_subndec(0, "refCount", ctx->refCount, msg)
-                    bfdebug_subnhex(0, "cr3", cr3, msg);
-                });
-            } else {
-                bferror_nhex(ERROR_LVL, "create: no free context available", gpa4k);
-                return 0ull;
-            }
+            bfdebug_transaction(SPLIT_CONTEXT_LVL, [&](std::string* msg) {
+                bfdebug_info(0, "create: new split context", msg);
+                bfdebug_subnhex(0, "cleanPhys", gpa4k, msg);
+                bfdebug_subnhex(0, "cleanVirt", gva4k, msg);
+                bfdebug_subnhex(0, "shadowPhys", ctx->shadowPhys, msg);;
+                bfdebug_subnhex(0, "shadowVirt", ctx->shadowVirt, msg);
+                bfdebug_subndec(0, "refCount", ctx->refCount, msg)
+                bfdebug_subnhex(0, "cr3", cr3, msg);
+            });
         }
 
        return 1ull;
@@ -793,11 +815,11 @@ private:
     // This function will deactivate (and free) a split context
     // for the give guest physical address (4k aligned).
     //
-    uint64_t deactivateSplitImpl(SplitPool::SplitContext* ctx) {
+    uint64_t deactivateSplitImpl(SplitPool::SplitContext const* ctx) {
         // Check if the reference count is greater than 0.
         //
         if (g_splits.decCounter(ctx) > 0ull)
-        { return 1ull; }
+            return 1ull;
 
         bfdebug_transaction(SPLIT_CONTEXT_LVL, [&](std::string* msg) {
             bfdebug_info(0, "deactivate: deactivating split context", msg);
@@ -819,24 +841,18 @@ private:
         {
             std::lock_guard lock{g_eptMutex};
             writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
-            ::intel_x64::vmx::invept_global();
         }
+
         const auto gpa4k = ctx->cleanPhys;
-        ctx->enabled = false;
-        ctx->shadowPage = nullptr;
+        g_splits.deleteContext(gpa4k);
 
         // Check if there are any more splits for the relevant
         // 2m page range.
         //
         const auto gpa2mStart = bfn::upper(gpa4k, ::intel_x64::ept::pd::from);
         const auto gpa2mEnd = gpa2mStart + ::intel_x64::ept::pd::page_size;
-        for (auto i = 0; i < MAX_SPLITS; ++i) {
-            const auto* temp = g_splits.getContextByIndex(i);
-            if (temp->enabled
-                && temp->cleanPhys >= gpa2mStart
-                && temp->cleanPhys < gpa2mEnd)
-                return 1ull;
-        }
+        if (g_splits.existsInRange(gpa2mStart, gpa2mEnd))
+            return 1ull;
 
         bfdebug_nhex(DEBUG_LVL, "deactivate: remapping 2m page range to 2m", gpa2mStart);
         // Since there are no more splits for the relevant 2m
@@ -846,9 +862,8 @@ private:
         {
             std::lock_guard lock{g_eptMutex};
             ept::identity_map_convert_4k_to_2m(g_mainMap, gpa2mStart);
-            auto& entry = g_mainMap.entry(gpa2mStart);
-            writePte(entry, ::intel_x64::ept::pd::entry::phys_addr::get(entry), AccessBitsT::all, pteMask2m);
-            ::intel_x64::vmx::invept_global();
+            // auto& entry = g_mainMap.entry(gpa2mStart);
+            // writePte(entry, ::intel_x64::ept::pd::entry::phys_addr::get(entry), AccessBitsT::all, pteMask2m);
         }
 
         return 1ull;
@@ -863,10 +878,12 @@ private:
         //
         const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
         const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
-        if (auto* ctx = g_splits.getContext(gpa4k); ctx != nullptr) {
+        if (auto* ctx = g_splits.findContext(gpa4k); ctx != nullptr) {
             // Call implementation.
             //
-            return deactivateSplitImpl(ctx);
+            const auto result = deactivateSplitImpl(ctx);
+            ::intel_x64::vmx::invept_global();
+            return result;
         } else {
             bfalert_nhex(ALERT_LVL, "deactivate: no split context found", gpa4k);
             return 0ull;
@@ -882,10 +899,11 @@ private:
         // Loop over all split contexts, until none
         // is enabled anymore.
         //
-        SplitPool::SplitContext* temp = g_splits.getFirstEnabledContext();
+        const auto* temp = g_splits.getContext();
         while (temp != nullptr) {
             deactivateSplitImpl(temp);
-            temp = g_splits.getFirstEnabledContext();
+            ::intel_x64::vmx::invept_global();
+            temp = g_splits.getContext();
         }
 
         return 1ull;
@@ -894,10 +912,10 @@ private:
     // This function returns 1, if there is a split for the passed
     // GVA, otherwise 0.
     //
-    uint64_t isSplit(const uintptr_t gva, const uint64_t cr3) noexcept {
+    uint64_t isSplit(const uintptr_t gva, const uint64_t cr3) const noexcept {
         const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
         const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
-        return g_splits.getContext(gpa4k) != nullptr;
+        return g_splits.findContext(gpa4k) != nullptr;
     }
 
     // This function will copy the given memory range from the guest memory
@@ -907,7 +925,7 @@ private:
         const auto dstGva4k = bfn::upper(dstGva, ::intel_x64::ept::pt::from);
         const auto dstGpa4k = bfvmm::x64::virt_to_phys_with_cr3(dstGva4k, cr3);
 
-        bfdebug_transaction(/*WRITE_LVL*/0, [&](std::string* msg) {
+        bfdebug_transaction(WRITE_LVL, [&](std::string* msg) {
             bfdebug_info(0, "writeMemory: arguments", msg);
             bfdebug_subnhex(0, "srcGva", srcGva, msg);
             bfdebug_subnhex(0, "dstGva", dstGva, msg);
@@ -916,7 +934,7 @@ private:
 
         // Check whether there is a split for the relevant 4k page.
         //
-        if (auto* ctx = g_splits.getContext(dstGpa4k); ctx != nullptr) {
+        if (auto* ctx = g_splits.findContext(dstGpa4k); ctx != nullptr) {
             // Check if we have to write to two consecutive pages.
             //
             const auto dstGvaEnd = dstGva + len - 1;
@@ -961,10 +979,10 @@ private:
                 // If not, create one.
                 //
                 const auto dstGpaEnd4k = bfvmm::x64::virt_to_phys_with_cr3(dstGvaEnd4k, cr3);
-                auto* ctx2 = g_splits.getContext(dstGpaEnd4k);
+                auto* ctx2 = g_splits.findContext(dstGpaEnd4k);
                 if (ctx2 == nullptr) {
                     createSplitContext(dstGvaEnd4k, cr3);
-                    if (ctx2 = g_splits.getContext(dstGpaEnd4k); ctx2 == nullptr) {
+                    if (ctx2 = g_splits.findContext(dstGpaEnd4k); ctx2 == nullptr) {
                         bferror_nhex(ERROR_LVL, "writeMemory: split for second page failed", dstGpaEnd4k);
                         return 0ull;
                     }
