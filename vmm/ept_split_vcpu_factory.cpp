@@ -14,13 +14,13 @@ using namespace eapis::intel_x64;
 // Macros for defining print levels.
 //
 #define VIOLATION_EXIT_LVL  0
-#define SPLIT_CONTEXT_LVL   1
-#define MONITOR_TRAP_LVL    0
+#define SPLIT_CONTEXT_LVL   0
+#define MONITOR_TRAP_LVL    1
 #define THRASHING_LVL       1
 #define ACCESS_BITS_LVL     1
 #define WRITE_LVL           1
 
-#define DEBUG_LVL           0
+#define DEBUG_LVL           1
 #define ALERT_LVL           0
 #define ERROR_LVL           0
 
@@ -436,7 +436,7 @@ public:
         if (const auto rip = vmcs->save_state()->rip; rip == m_prevRip) {
             // Check for thrashing.
             //
-            if (m_ripCounter > 3)
+            if (++m_ripCounter; m_ripCounter > 3)
             {
                 bfalert_nhex(THRASHING_LVL, "read: thrashing detected", m_prevRip);
                 m_ripCounter = 1;
@@ -598,7 +598,7 @@ public:
         if (const auto rip = vmcs->save_state()->rip; rip == m_prevRip) {
             // Check for thrashing.
             //
-            if (m_ripCounter > 3)
+            if (++m_ripCounter; m_ripCounter > 3)
             {
                 bfalert_nhex(THRASHING_LVL, "exec: thrashing detected", m_prevRip);
                 m_ripCounter = 1;
