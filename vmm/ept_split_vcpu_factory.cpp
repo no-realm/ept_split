@@ -13,9 +13,9 @@ using namespace eapis::intel_x64;
 
 // Macros for defining print levels.
 //
-#define VIOLATION_EXIT_LVL  0
-#define SPLIT_CONTEXT_LVL   0
-#define MONITOR_TRAP_LVL    1
+#define VIOLATION_EXIT_LVL  1
+#define SPLIT_CONTEXT_LVL   1
+#define MONITOR_TRAP_LVL    0
 #define THRASHING_LVL       1
 #define ACCESS_BITS_LVL     1
 #define WRITE_LVL           1
@@ -459,6 +459,7 @@ public:
             bfdebug_subnhex(0, "gva", info.gva, msg);
             bfdebug_subnhex(0, "gpa4k", gpa4k, msg);
             bfdebug_subnhex(0, "cr3", vmcs_n::guest_cr3::get(), msg);
+            bfdebug_subndec(0, "exit qualifications", info.exit_qualification, msg);
         });
 
         // Check if there is a split context for the requested page.
@@ -479,7 +480,6 @@ public:
                 bferror_nhex(ERROR_LVL, "read: write not enabled", gpa4k);
             #endif
         } else {
-
             // Check page granularity.
             //
             if (g_mainMap.is_4k(gpa4k)) {
@@ -524,6 +524,7 @@ public:
             bfdebug_subnhex(0, "gva", info.gva, msg);
             bfdebug_subnhex(0, "gpa4k", gpa4k, msg);
             bfdebug_subnhex(0, "cr3", vmcs_n::guest_cr3::get(), msg);
+            bfdebug_subndec(0, "exit qualifications", info.exit_qualification, msg);
         });
 
         // Check if there is a split context for the requested page.
@@ -549,13 +550,13 @@ public:
             }
             else
             {
-                bfalert_nhex(ALERT_LVL, "write: different cr3", vmcs_n::guest_cr3::get());
-
                 // Deactivate the split context, since it seems like the
                 // application changed.
                 //
-                if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte.get()))
+                if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte.get())) {
+                    bfalert_nhex(ALERT_LVL, "write: different cr3", vmcs_n::guest_cr3::get());
                     deactivateSplitImpl(ctx);
+                }
             }
         } else {
             // Check page granularity.
@@ -621,6 +622,7 @@ public:
             bfdebug_subnhex(0, "gva", info.gva, msg);
             bfdebug_subnhex(0, "gpa4k", gpa4k, msg);
             bfdebug_subnhex(0, "cr3", vmcs_n::guest_cr3::get(), msg);
+            bfdebug_subndec(0, "exit qualifications", info.exit_qualification, msg);
         });
 
         // Check if there is a split context for the requested page.
@@ -646,13 +648,13 @@ public:
             }
             else
             {
-                bfalert_nhex(ALERT_LVL, "exec: different cr3", vmcs_n::guest_cr3::get());
-
                 // Deactivate the split context, since it seems like the
                 // application changed.
                 //
-                if (::intel_x64::ept::pt::entry::execute_access::is_disabled(ctx->pte.get()))
+                if (::intel_x64::ept::pt::entry::execute_access::is_disabled(ctx->pte.get())) {
+                    bfalert_nhex(ALERT_LVL, "exec: different cr3", vmcs_n::guest_cr3::get());
                     deactivateSplitImpl(ctx);
+                }
             }
         } else {
             // Check page granularity.
