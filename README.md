@@ -3,16 +3,10 @@
 ## Description
 
 *TBD*
-Using EPT to hook a function call is a common use case for reverse engineering,
-introspection, and offensive / defensive research. This repository provides a
-simple example of how this can be done using the [Bareflank Hypervisor](https://github.com/Bareflank/hypervisor),
-and the [Extended APIs](https://github.com/Bareflank/extended_apis) repo using EPT.
-For further information about the Bareflank Hypervisor and how to create extensions, please see the following
-documentation.
 
 ## Compilation / Usage
 
-To setup our extension, run the following (tested with Cygwin):
+To setup the extension, run the following (tested with Cygwin):
 
 ```
 git clone https://github.com/Bareflank/hypervisor
