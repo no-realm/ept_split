@@ -15,7 +15,7 @@ using namespace eapis::intel_x64;
 //
 #define VIOLATION_EXIT_LVL  1
 #define SPLIT_CONTEXT_LVL   1
-#define MONITOR_TRAP_LVL    0
+#define MONITOR_TRAP_LVL    1
 #define THRASHING_LVL       1
 #define ACCESS_BITS_LVL     1
 #define WRITE_LVL           1
