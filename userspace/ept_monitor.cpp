@@ -52,19 +52,17 @@ struct vmcall_registers_t
 
 extern "C" void _platform_vmcall(struct vmcall_registers_t *regs) noexcept;
 
-void
-hello_world()
-{ std::clog << "hello world\n"; }
+std::string testString = "hello world\n";
 
 void
-hooked_hello_world()
-{ std::clog << "hooked hello world\n"; }
+hello_world()
+{ std::clog << testString; }
 
 int main()
 {
     // Set affinity.
     //
-    // set_affinity(0);
+    set_affinity(0);
 
     // Registers for VMCall
     //
@@ -72,13 +70,15 @@ int main()
 
     // Check if the HV is present.
     //
-    regs.r02 = 0;
-    _platform_vmcall(&regs);
-    if (!regs.r02)
-    {
-        std::clog << "hv not present\n";
-        return 1;
-    }
+    // regs.r02 = 0;
+    // _platform_vmcall(&regs);
+    // if (!regs.r02)
+    // {
+    //     std::clog << "hv not present\n";
+    //     return 1;
+    // }
+
+    hello_world();
 
     // Create split context.
     //
@@ -103,8 +103,7 @@ int main()
 
     hello_world();
 
-    // regs.r02 = 3;
-    // regs.r03 = reinterpret_cast<uintptr_t>(hello_world);
+    // regs.r02 = 4;
     // _platform_vmcall(&regs);
     // if (!regs.r02)
     // {
