@@ -704,7 +704,7 @@ public:
         // Revert back to the main memory map.
         //
         eapis()->set_eptp(g_mainMap);
-        ::intel_x64::vmx::invept_global();
+
         return true;
     }
 
@@ -759,7 +759,6 @@ private:
                 //
                 std::lock_guard lock{g_eptMutex};
                 ept::identity_map_convert_2m_to_4k(g_mainMap, gpa2m);
-                ::intel_x64::vmx::invept_global();  // necessary?
             } else {
                 bfdebug_nhex(DEBUG_LVL, "create: already remapped", gpa4k);
             }
@@ -768,9 +767,7 @@ private:
             //
             bfdebug_nhex(DEBUG_LVL, "create: creating split context", gpa4k);
             ctx = g_splits.createContext(gva4k, gpa4k, cr3);
-
             flipPage(ctx, PageT::shadow);
-            ::intel_x64::vmx::invept_global();
 
             bfdebug_transaction(SPLIT_CONTEXT_LVL, [&](std::string* msg) {
                 bfdebug_info(0, "create: new split context", msg);
@@ -781,6 +778,9 @@ private:
                 bfdebug_subndec(0, "refCount", ctx->refCount, msg)
                 bfdebug_subnhex(0, "cr3", cr3, msg);
             });
+
+            ::intel_x64::vmx::invept_global();
+            ::intel_x64::vmx::invvpid_all_contexts();
         }
 
        return 1ull;
@@ -857,6 +857,7 @@ private:
             //
             const auto result = deactivateSplitImpl(ctx);
             ::intel_x64::vmx::invept_global();
+            ::intel_x64::vmx::invvpid_all_contexts();
             return result;
         } else {
             bfalert_nhex(ALERT_LVL, "deactivate: no split context found", gpa4k);
@@ -876,10 +877,11 @@ private:
         const auto* temp = g_splits.getContext();
         while (temp != nullptr) {
             deactivateSplitImpl(temp);
-            ::intel_x64::vmx::invept_global();
             temp = g_splits.getContext();
         }
 
+        ::intel_x64::vmx::invept_global();
+        ::intel_x64::vmx::invvpid_all_contexts();
         return 1ull;
     }
 
