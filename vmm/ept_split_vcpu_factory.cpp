@@ -11,18 +11,23 @@ using namespace eapis::intel_x64;
 #include <mutex>
 #include <shared_mutex>
 
+
 // Macros for defining print levels.
 //
 #define VIOLATION_EXIT_LVL  1
 #define SPLIT_CONTEXT_LVL   1
 #define MONITOR_TRAP_LVL    1
 #define THRASHING_LVL       1
-#define ACCESS_BITS_LVL     1
+#define ACCESS_BITS_LVL     0
 #define WRITE_LVL           1
 
 #define DEBUG_LVL           1
 #define ALERT_LVL           0
 #define ERROR_LVL           0
+
+// Thrashing detection settings
+// 
+#define ENABLE_THRASHNG_TRAP 0
 
 // -----------------------------------------------------------------------------
 // vCPU
@@ -33,14 +38,15 @@ namespace ept_split
 
 // This flag is used in the call_once call.
 //
-bfn::once_flag flag{};
+bfn::once_flag f_maps_initialized{};
 
 // We one main memory map and one copy,
 // which is for single stepping, for the
 // case we detect thrashing.
 //
-ept::mmap g_mainMap{};
-ept::mmap g_trapMap{};
+ept::mmap g_executeMap{};
+ept::mmap g_cleanMap{};
+ept::mmap g_readWriteMap{};
 ept::mmap::entry_type g_dummyPte{};
 
 // Mutex for EPT modifications.
@@ -54,15 +60,18 @@ public:
     // Context for holding information about a split.
     //
     struct SplitContext {
+
+        uint64_t cr3{};
+        size_t refCount{};
+
         uintptr_t cleanPhys{};
         uintptr_t shadowPhys{};
-
-        std::reference_wrapper<ept::mmap::entry_type> pte{g_dummyPte};
         uintptr_t shadowVirt{};
         uintptr_t cleanVirt{};
 
-        size_t refCount{};
-        uint64_t cr3{};
+        std::reference_wrapper<ept::mmap::entry_type> readWrite_pte{g_dummyPte};
+        std::reference_wrapper<ept::mmap::entry_type> execute_pte{g_dummyPte};
+        
         std::unique_ptr<uint8_t[]> shadowPage{nullptr};
     };
 
@@ -124,7 +133,8 @@ public:
         // Insert other needed data.
         //
         ctx->cr3 = cr3;
-        ctx->pte = g_mainMap.entry(gpa4k);
+        ctx->readWrite_pte = g_readWriteMap.entry(gpa4k);
+        ctx->execute_pte = g_executeMap.entry(gpa4k);
         ctx->cleanVirt = gva4k;
         ctx->cleanPhys = gpa4k;
         ctx->refCount = 1;
@@ -245,24 +255,21 @@ class Vcpu : public eapis::intel_x64::vcpu
 
     // Helper function for writing to page table entries (PTE).
     //
-    void writePte(
-        uintptr_t& pte, const uintptr_t physAddr, const AccessBitsT bits, const uint64_t mask = pteMask4k) noexcept
-    { pte = set_bits(pte, mask, physAddr | bits); }
-
-    // Helper function for flipping between pages
-    //
-    // Sets the physical address and access bits for
-    // the provided split context.
-    //
-    void flipPage(SplitPool::SplitContext const* ctx, const PageT flipTo) noexcept {
-        if (flipTo == PageT::clean)
-        { writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::read_write); }
-        else
-        { writePte(ctx->pte.get(), ctx->shadowPhys, AccessBitsT::execute); }
+    void writePte(uintptr_t& pte, const uintptr_t physAddr, const AccessBitsT bits, const uint64_t mask = pteMask4k) noexcept
+    { 
+        std::lock_guard lock{g_eptMutex};
+        pte = set_bits(pte, mask, physAddr | bits);
+    }
+ 
+    void enableContext(SplitPool::SplitContext const* context){
+        writePte(context->readWrite_pte.get(), context->cleanPhys, AccessBitsT::read_write);
+        writePte(context->execute_pte.get(), context->shadowPhys, AccessBitsT::execute);
     }
 
-    void flipPage(uintptr_t gpa4k, const PageT flipTo) noexcept {
-        flipPage(g_splits.findContext(gpa4k), flipTo);
+    void disableContext(SplitPool::SplitContext const* context)
+    {
+        writePte(context->readWrite_pte.get(), context->cleanPhys, AccessBitsT::all);
+        writePte(context->execute_pte.get(), context->cleanPhys, AccessBitsT::all);
     }
 
     // For thrashing detection.
@@ -312,13 +319,14 @@ public:
 
         // Setup the EPT memory map once.
         //
-        bfn::call_once(flag, [&] {
-            ept::identity_map(g_mainMap, MAX_PHYS_ADDR);
-            ept::identity_map(g_trapMap, MAX_PHYS_ADDR);
+        bfn::call_once(f_maps_initialized, [&] {
+            ept::identity_map(g_cleanMap, MAX_PHYS_ADDR);
+            ept::identity_map(g_executeMap, MAX_PHYS_ADDR);
+            ept::identity_map(g_readWriteMap, MAX_PHYS_ADDR);
         });
 
         eapis()->enable_vpid();
-        eapis()->set_eptp(g_mainMap);
+        eapis()->set_eptp(g_readWriteMap);
     }
 
     // -----------------------------------------------------------------------------
@@ -412,6 +420,14 @@ public:
                     state->rcx = -1ull;
                     break;
 
+                case 11ull:
+                    state->rcx = -1ull;
+                    break;
+
+                case 12ull:
+                    state->rcx = flipMap();
+                    break;
+
                 default:
                     state->rcx = -1ull;
                     break;
@@ -436,20 +452,22 @@ public:
         if (const auto rip = vmcs->save_state()->rip; rip == m_prevRip) {
             // Check for thrashing.
             //
-            if (++m_ripCounter; m_ripCounter > 3)
+            if (++m_ripCounter; ENABLE_THRASHNG_TRAP == 1 && m_ripCounter > 3)
             {
                 bfalert_nhex(THRASHING_LVL, "read: thrashing detected", m_prevRip);
                 m_ripCounter = 1;
 
                 // Enable monitor trap flag for single stepping.
                 //
-                eapis()->set_eptp(g_trapMap);
+                eapis()->set_eptp(g_cleanMap);
                 eapis()->enable_monitor_trap_flag();
 
                 return true;
             }
         }
-        else { m_prevRip = rip; m_ripCounter = 1; }
+        else {
+             m_prevRip = rip; m_ripCounter = 1;
+        }
 
         const auto gpa4k = bfn::upper(info.gpa, ::intel_x64::ept::pt::from);
 
@@ -466,53 +484,29 @@ public:
         //
         if (const auto* ctx = g_splits.findContext(gpa4k); ctx != nullptr)
         {
-            // Flip to clean page.
-            //
-            std::lock_guard lock{g_eptMutex};
-            flipPage(ctx, PageT::clean);
+            // Flip to read/write map.
+            eapis()->set_eptp(g_readWriteMap);
 
-            #if DEBUG_LEVEL > ACCESS_BITS_LVL
-            if (::intel_x64::ept::pt::entry::execute_access::is_enabled(ctx->pte.get()))
+            // #if DEBUG_LEVEL > ACCESS_BITS_LVL
+            // always show errors
+            if (::intel_x64::ept::pt::entry::execute_access::is_enabled(ctx->readWrite_pte.get()))
                 bferror_nhex(ERROR_LVL, "read: exec not disabled", gpa4k);
-            if (::intel_x64::ept::pt::entry::read_access::is_disabled(ctx->pte.get()))
+            if (::intel_x64::ept::pt::entry::read_access::is_disabled(ctx->readWrite_pte.get()))
                 bferror_nhex(ERROR_LVL, "read: read not enabled", gpa4k);
-            if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte.get()))
+            if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->readWrite_pte.get()))
                 bferror_nhex(ERROR_LVL, "read: write not enabled", gpa4k);
-            #endif
+            // #endif
+
         } else {
             // Check page granularity.
-            //
-            if (g_mainMap.is_4k(gpa4k)) {
-                using namespace ::intel_x64::ept::pt::entry;
-                auto& entry = g_mainMap.entry(gpa4k);
-
-                // Check for outdated access bits.
-                //
-                if (!read_access::is_enabled(entry))
-                {
-                    bfalert_nhex(ALERT_LVL, "read: resetting access bits for 4k entry", gpa4k);
-                    std::lock_guard lock{g_eptMutex};
-                    writePte(entry, phys_addr::get(entry), AccessBitsT::all);
-                }
-            } else {
-                using namespace ::intel_x64::ept::pd::entry;
-                auto& entry = g_mainMap.entry(gpa4k);
-
-                // Check for outdated access bits.
-                //
-                if (!read_access::is_enabled(entry))
-                {
-                    const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pt::from);
-                    bfalert_nhex(ALERT_LVL, "read: resetting access bits for 2m entry", gpa2m);
-                    std::lock_guard lock{g_eptMutex};
-                    writePte(entry, phys_addr::get(entry), AccessBitsT::all);
-                }
-            }
+            restoreAccessType(&g_readWriteMap, gpa4k, AccessBitsT::read);
         }
 
         // info.ignore_advance = true;
         return true;
     }
+
+    
 
     bool ept_write_violation_handler(gsl::not_null<vmcs_t *> vmcs, ept_violation_handler::info_t &info) {
         m_prevRip = 0; m_ripCounter = 0;
@@ -534,59 +528,33 @@ public:
             // Check if the write violation occurred in the same CR3 context.
             //
             if (ctx->cr3 == vmcs_n::guest_cr3::get()) {
-                // Flip to clean page.
-                //
-                std::lock_guard lock{g_eptMutex};
-                flipPage(ctx, PageT::clean);
 
-                #if DEBUG_LEVEL > ACCESS_BITS_LVL
-                if (::intel_x64::ept::pt::entry::execute_access::is_enabled(ctx->pte.get()))
+                // Flip to read/write map.
+                eapis()->set_eptp(g_readWriteMap);
+
+                // #if DEBUG_LEVEL > ACCESS_BITS_LVL
+                // always show errors
+                if (::intel_x64::ept::pt::entry::execute_access::is_enabled(ctx->readWrite_pte.get()))
                     bferror_nhex(ERROR_LVL, "write: exec not disabled", gpa4k);
-                if (::intel_x64::ept::pt::entry::read_access::is_disabled(ctx->pte.get()))
+                if (::intel_x64::ept::pt::entry::read_access::is_disabled(ctx->readWrite_pte.get()))
                     bferror_nhex(ERROR_LVL, "write: read not enabled", gpa4k);
-                if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte.get()))
+                if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->readWrite_pte.get()))
                     bferror_nhex(ERROR_LVL, "write: write not enabled", gpa4k);
-                #endif
+                //#endif
             }
             else
             {
                 // Deactivate the split context, since it seems like the
                 // application changed.
                 //
-                if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->pte.get())) {
+                if (::intel_x64::ept::pt::entry::write_access::is_disabled(ctx->execute_pte.get())) {
                     bfalert_nhex(ALERT_LVL, "write: different cr3", vmcs_n::guest_cr3::get());
                     deactivateSplitImpl(ctx);
                 }
             }
         } else {
             // Check page granularity.
-            //
-            if (g_mainMap.is_4k(gpa4k)) {
-                using namespace ::intel_x64::ept::pt::entry;
-                auto& entry = g_mainMap.entry(gpa4k);
-
-                // Check for outdated access bits.
-                //
-                if (!write_access::is_enabled(entry))
-                {
-                    bfalert_nhex(ALERT_LVL, "write: resetting access bits for 4k entry", gpa4k);
-                    std::lock_guard lock{g_eptMutex};
-                    writePte(entry, phys_addr::get(entry), AccessBitsT::all);
-                }
-            } else {
-                using namespace ::intel_x64::ept::pd::entry;
-                auto& entry = g_mainMap.entry(gpa4k);
-
-                // Check for outdated access bits.
-                //
-                if (!write_access::is_enabled(entry))
-                {
-                    const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pt::from);
-                    bfalert_nhex(ALERT_LVL, "write: resetting access bits for 2m entry", gpa2m);
-                    std::lock_guard lock{g_eptMutex};
-                    writePte(entry, phys_addr::get(entry), AccessBitsT::all);
-                }
-            }
+            restoreAccessType(&g_readWriteMap, gpa4k, AccessBitsT::write);
         }
 
         // info.ignore_advance = true;
@@ -599,14 +567,14 @@ public:
         if (const auto rip = vmcs->save_state()->rip; rip == m_prevRip) {
             // Check for thrashing.
             //
-            if (++m_ripCounter; m_ripCounter > 3)
+            if (++m_ripCounter; ENABLE_THRASHNG_TRAP == 1 && m_ripCounter > 3)
             {
                 bfalert_nhex(THRASHING_LVL, "exec: thrashing detected", m_prevRip);
                 m_ripCounter = 1;
 
                 // Enable monitor trap flag for single stepping.
                 //
-                eapis()->set_eptp(g_trapMap);
+                eapis()->set_eptp(g_cleanMap);
                 eapis()->enable_monitor_trap_flag();
 
                 return true;
@@ -632,59 +600,33 @@ public:
             // Check if the exec violation occurred in the same CR3 context.
             //
             if (ctx->cr3 == vmcs_n::guest_cr3::get()) {
-                // Flip to shadow page.
-                //
-                std::lock_guard lock{g_eptMutex};
-                flipPage(ctx, PageT::shadow);
 
-                #if DEBUG_LEVEL > ACCESS_BITS_LVL
-                if (::intel_x64::ept::pt::entry::execute_access::is_disabled(ctx->pte.get()))
+                 // Flip to execute map.
+                eapis()->set_eptp(g_executeMap);
+
+                // #if DEBUG_LEVEL > ACCESS_BITS_LVL
+                // always show errors
+                if (::intel_x64::ept::pt::entry::execute_access::is_disabled(ctx->execute_pte.get()))
                     bferror_nhex(ERROR_LVL, "exec: exec not enabled", gpa4k);
-                if (::intel_x64::ept::pt::entry::read_access::is_enabled(ctx->pte.get()))
+                if (::intel_x64::ept::pt::entry::read_access::is_enabled(ctx->execute_pte.get()))
                     bferror_nhex(ERROR_LVL, "exec: read not disabled", gpa4k);
-                if (::intel_x64::ept::pt::entry::write_access::is_enabled(ctx->pte.get()))
+                if (::intel_x64::ept::pt::entry::write_access::is_enabled(ctx->execute_pte.get()))
                     bferror_nhex(ERROR_LVL, "exec: write not disabled", gpa4k);
-                #endif
+                // #endif
             }
             else
             {
                 // Deactivate the split context, since it seems like the
                 // application changed.
                 //
-                if (::intel_x64::ept::pt::entry::execute_access::is_disabled(ctx->pte.get())) {
+                if (::intel_x64::ept::pt::entry::execute_access::is_disabled(ctx->readWrite_pte.get())) {
                     bfalert_nhex(ALERT_LVL, "exec: different cr3", vmcs_n::guest_cr3::get());
                     deactivateSplitImpl(ctx);
                 }
             }
         } else {
             // Check page granularity.
-            //
-            if (g_mainMap.is_4k(gpa4k)) {
-                using namespace ::intel_x64::ept::pt::entry;
-                auto& entry = g_mainMap.entry(gpa4k);
-
-                // Check for outdated access bits.
-                //
-                if (!execute_access::is_enabled(entry))
-                {
-                    bfalert_nhex(ALERT_LVL, "exec: resetting access bits for 4k entry", gpa4k);
-                    std::lock_guard lock{g_eptMutex};
-                    writePte(entry, phys_addr::get(entry), AccessBitsT::all);
-                }
-            } else {
-                using namespace ::intel_x64::ept::pd::entry;
-                auto& entry = g_mainMap.entry(gpa4k);
-
-                // Check for outdated access bits.
-                //
-                if (!execute_access::is_enabled(entry))
-                {
-                    const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pt::from);
-                    bfalert_nhex(ALERT_LVL, "exec: resetting access bits for 2m entry", gpa2m);
-                    std::lock_guard lock{g_eptMutex};
-                    writePte(entry, phys_addr::get(entry), AccessBitsT::all);
-                }
-            }
+            restoreAccessType(&g_executeMap, gpa4k, AccessBitsT::execute);
         }
 
         // info.ignore_advance = true;
@@ -703,12 +645,62 @@ public:
         bfalert_nhex(MONITOR_TRAP_LVL, "trap: rip", vmcs->save_state()->rip);
         // Revert back to the main memory map.
         //
-        eapis()->set_eptp(g_mainMap);
+        eapis()->set_eptp(g_readWriteMap);
 
         return true;
     }
 
 private:
+
+    // restores access to the pte for the given map if it is not set
+    //
+    void restoreAccessType(ept::mmap* map, const uintptr_t gpa4k, const AccessBitsT accessType)
+    {
+        using namespace ::intel_x64::ept::pt::entry;
+        auto& entry = map->entry(gpa4k);
+
+        if (!isAccessEnabled(entry, accessType))
+            writePte(entry, phys_addr::get(entry), AccessBitsT::all);
+
+
+        if (map->is_4k(gpa4k)) {
+            bfalert_nhex(ALERT_LVL, "read: resetting access bits for 4k entry", gpa4k);
+        }
+        else {
+            const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pt::from);
+            bfalert_nhex(ALERT_LVL, "read: resetting access bits for 2m entry", gpa2m);
+        }
+    }
+
+
+    // checks whether a specific access for a pte is enabled
+    //
+    bool isAccessEnabled(uintptr_t& entry, const AccessBitsT accessType)
+    {
+        using namespace ::intel_x64::ept::pt::entry;
+        if (accessType == AccessBitsT::read)
+            return read_access::is_enabled(entry);
+
+        if (accessType == AccessBitsT::write)
+            return write_access::is_enabled(entry);
+
+        if (accessType == AccessBitsT::execute)
+            return execute_access::is_enabled(entry);
+
+        return false;
+    }
+
+
+    // This function was implemented for measuring the 
+    // performance cost of flipping maps
+    //
+    uint64_t flipMap()
+    {
+        eapis()->set_eptp(g_cleanMap);
+        eapis()->set_eptp(g_executeMap);
+        return 1ull;
+    }
+
 
     // This function returns 1 to the caller
     // to indicate that the HV is present.
@@ -734,40 +726,30 @@ private:
     uint64_t createSplitContext(const uintptr_t gva, const uint64_t cr3) {
         // Check whether there already is a split for
         // the relevant 4k page.
-        //
-        const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
+        const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from); 
         const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
+
         if (const auto* ctx = g_splits.findContext(gpa4k); ctx != nullptr) {
             // Since we already have a split for the requested gva,
             // we will just increase the refCounter.
-            //
             g_splits.incCounter(ctx);
 
             bfdebug_transaction(DEBUG_LVL, [&](std::string* msg) {
                 bfdebug_nhex(0, "create: increased refCount", gpa4k, msg);
                 bfdebug_subndec(0, "refCount", ctx->refCount, msg);
             });
+
         } else {
+
             // We don't seem to have a split for the requested gva,
             // check whether we have to remap the relevant 2m page range.
-            //
-            if (!g_mainMap.is_4k(gpa4k)) {
-                const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pd::from);
-                bfdebug_nhex(DEBUG_LVL, "create: remapping 2m page range to 4k", gpa2m);
-                // We need to remap the relevant 2m page range
-                // to 4k granularity.
-                //
-                std::lock_guard lock{g_eptMutex};
-                ept::identity_map_convert_2m_to_4k(g_mainMap, gpa2m);
-            } else {
-                bfdebug_nhex(DEBUG_LVL, "create: already remapped", gpa4k);
-            }
+            ensurePageRangeIs4k(&g_executeMap, gpa4k);
+            ensurePageRangeIs4k(&g_readWriteMap, gpa4k);
 
             // Create new context.
-            //
             bfdebug_nhex(DEBUG_LVL, "create: creating split context", gpa4k);
             ctx = g_splits.createContext(gva4k, gpa4k, cr3);
-            flipPage(ctx, PageT::shadow);
+            enableContext(ctx);
 
             bfdebug_transaction(SPLIT_CONTEXT_LVL, [&](std::string* msg) {
                 bfdebug_info(0, "create: new split context", msg);
@@ -784,6 +766,25 @@ private:
         }
 
        return 1ull;
+    }
+
+    // Converts the given map range to 4k if that is not already the case
+    //
+    uint64_t ensurePageRangeIs4k(ept::mmap* map, const uintptr_t gpa4k)
+    {
+        if (!map->is_4k(gpa4k)) {
+            const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pd::from);
+            bfdebug_nhex(DEBUG_LVL, "remapping 2m page range to 4k", gpa2m);
+
+            // We need to remap the relevant 2m page range
+            // to 4k granularity.
+            std::lock_guard lock{g_eptMutex};
+            ept::identity_map_convert_2m_to_4k(*map, gpa2m);
+        } else {
+            bfdebug_nhex(DEBUG_LVL, "already remapped", gpa4k);
+        }
+
+        return 1ull;
     }
 
     // This function will deactivate (and free) a split context
@@ -806,17 +807,13 @@ private:
         });
 
         bfdebug_nhex(DEBUG_LVL, "deactivate: deactivating split context", ctx->cleanPhys);
+
         // Since we are the last one to use the split context,
         // we should be able to safely disable this split context.
         // We will first flip to the clean page and then restore
         // pass-through access bits. Only then will we disable the
         // split context and deallocate the shadow page.
-        //
-        {
-            std::lock_guard lock{g_eptMutex};
-            writePte(ctx->pte.get(), ctx->cleanPhys, AccessBitsT::all);
-        }
-
+        disableContext(ctx);
         const auto gpa4k = ctx->cleanPhys;
         g_splits.deleteContext(gpa4k);
 
@@ -825,6 +822,7 @@ private:
         //
         const auto gpa2mStart = bfn::upper(gpa4k, ::intel_x64::ept::pd::from);
         const auto gpa2mEnd = gpa2mStart + ::intel_x64::ept::pd::page_size;
+
         if (g_splits.existsInRange(gpa2mStart, gpa2mEnd))
             return 1ull;
 
@@ -835,9 +833,8 @@ private:
         //
         {
             std::lock_guard lock{g_eptMutex};
-            ept::identity_map_convert_4k_to_2m(g_mainMap, gpa2mStart);
-            // auto& entry = g_mainMap.entry(gpa2mStart);
-            // writePte(entry, ::intel_x64::ept::pd::entry::phys_addr::get(entry), AccessBitsT::all, pteMask2m);
+            ept::identity_map_convert_4k_to_2m(g_executeMap, gpa2mStart);
+            ept::identity_map_convert_4k_to_2m(g_readWriteMap, gpa2mStart);
         }
 
         return 1ull;
