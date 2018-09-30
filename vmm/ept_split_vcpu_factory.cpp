@@ -14,17 +14,17 @@ using namespace eapis::intel_x64;
 
 // Macros for defining print levels.
 //
-#define VIOLATION_EXIT_LVL  0
-#define SPLIT_CONTEXT_LVL   0
-#define MONITOR_TRAP_LVL    0
-#define THRASHING_LVL       0
+#define VIOLATION_EXIT_LVL  1
+#define SPLIT_CONTEXT_LVL   1
+#define MONITOR_TRAP_LVL    1
+#define THRASHING_LVL       1
 #define WRITE_LVL           1
 
-#define DEBUG_LVL           0
+#define DEBUG_LVL           1
 #define ALERT_LVL           0
 #define ERROR_LVL           0
 
-// Toggle macros
+// Toggle macros.
 //
 #define ENABLE_ACCESS_CHECK  0
 #define ENABLE_THRASHING     1
@@ -666,21 +666,10 @@ public:
         // Update thrashing info.
         //
         #if ENABLE_THRASHING
-        if (const auto rip = vmcs->save_state()->rip; rip != m_prevRip) {
-            // Check for thrashing.
-            //
-            if (++m_ripCounter; m_ripCounter > 3) {
-                bfalert_nhex(THRASHING_LVL, "exec: thrashing detected", m_prevRip);
-                m_ripCounter = 1;
-
-                // Enable monitor trap flag for single stepping.
-                //
-                eapis()->set_eptp(g_cleanMap);
-                eapis()->enable_monitor_trap_flag();
-
-                return true;
-            }
-        } else { m_prevRip = rip; m_ripCounter = 1; }
+        if (const auto rip = vmcs->save_state()->rip; rip == m_prevRip)
+        { m_ripCounter++; }
+        else
+        { m_prevRip = rip; m_ripCounter = 1; }
         #endif
 
         const auto gpa4k = bfn::upper(info.gpa, ::intel_x64::ept::pt::from);
@@ -760,6 +749,7 @@ private:
         const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
         const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
         if (const auto* ctx = g_splits.findContext(gpa4k); ctx != nullptr) {
+            bfdebug_nhex(DEBUG_LVL, "activate: activating split context", gpa4k);
             enableContext(ctx);
             return 1ull;
         }
@@ -775,6 +765,7 @@ private:
         const auto gva4k = bfn::upper(gva, ::intel_x64::ept::pt::from);
         const auto gpa4k = bfvmm::x64::virt_to_phys_with_cr3(gva4k, cr3);
         if (const auto* ctx = g_splits.findContext(gpa4k); ctx != nullptr) {
+            bfdebug_nhex(DEBUG_LVL, "activate: deactivating split context", gpa4k);
             disableContext(ctx);
             return 1ull;
         }
@@ -1020,6 +1011,7 @@ private:
                 auto* ctx2 = g_splits.findContext(dstGpaEnd4k);
                 if (ctx2 == nullptr) {
                     createSplitContext(dstGvaEnd4k, cr3);
+                    activateSplit(dstGvaEnd4k, cr3);
                     if (ctx2 = g_splits.findContext(dstGpaEnd4k); ctx2 == nullptr) {
                         bferror_nhex(ERROR_LVL, "writeMemory: split for second page failed", dstGpaEnd4k);
                         return 0ull;
