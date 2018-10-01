@@ -17,7 +17,6 @@ using namespace eapis::intel_x64;
 #define VIOLATION_EXIT_LVL  1
 #define SPLIT_CONTEXT_LVL   1
 #define MONITOR_TRAP_LVL    1
-#define THRASHING_LVL       1
 #define WRITE_LVL           1
 
 #define DEBUG_LVL           1
@@ -264,6 +263,7 @@ class vcpu : public eapis::intel_x64::vcpu
     // Resets access bits of the requested page in the given EPT map, if the given bits are not set.
     //
     void resetAccessBits(ept::mmap* map, const uintptr_t gpa4k, const AccessBitsT accessBits) {
+        bfdebug_nhex(DEBUG_LVL, "reset: checking granularity", gpa4k);
         if (map->is_4k(gpa4k)) {
             if (auto& entry = map->entry(gpa4k); !checkAccessBits(entry, accessBits)) {
                 using namespace ::intel_x64::ept::pt::entry;
@@ -277,7 +277,7 @@ class vcpu : public eapis::intel_x64::vcpu
                 const auto gpa2m = bfn::upper(gpa4k, ::intel_x64::ept::pd::from);
                 bfalert_nhex(ALERT_LVL, "reset: resetting access bits for 2m entry", gpa2m);
                 std::lock_guard lock{g_eptMutex};
-                writePte(entry, phys_addr::get(entry), AccessBitsT::all);
+                writePte(entry, phys_addr::get(entry), AccessBitsT::all, pteMask2m);
             }
         }
     }
@@ -563,7 +563,6 @@ public:
             // Check for thrashing.
             //
             if (++m_ripCounter; m_ripCounter > 3) {
-                bfalert_nhex(THRASHING_LVL, "read: thrashing detected", m_prevRip);
                 m_ripCounter = 1;
 
                 // Enable monitor trap flag for single stepping.
