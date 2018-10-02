@@ -166,7 +166,7 @@ public:
     // Returns, if available, the last split context,
     // else returns nullptr.
     //
-    SplitContext const* getContext() noexcept {
+    SplitContext const* getContext() const noexcept {
         if (m_splitContexts.empty())
             return nullptr;
 
@@ -514,6 +514,7 @@ public:
                 {
                     eapis()->set_eptp(g_readWriteMap);
                     state->rcx = 1ull;
+                    break;
                 }
 
                 // Disable splitting.
@@ -521,6 +522,7 @@ public:
                 {
                     eapis()->set_eptp(g_cleanMap);
                     state->rcx = 1ull;
+                    break;
                 }
 
                 // deactivate_split(int_t gva)
