@@ -19,7 +19,7 @@ using namespace eapis::intel_x64;
 #define MONITOR_TRAP_LVL    1
 #define WRITE_LVL           1
 
-#define DEBUG_LVL           1
+#define DEBUG_LVL           0
 #define ALERT_LVL           0
 #define ERROR_LVL           0
 
